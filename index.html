@@ -953,7 +953,7 @@ function Row({ l, v, b, cls, hint }) {
   return html`<div style="display:flex;justify-content:space-between;gap:12px;padding:7px 0;border-bottom:1px solid var(--line)"><span>${l}${hint ? html`<span class="mut" style="font-size:.8rem"> ${hint}</span>` : null}</span><span class=${'num ' + (cls || '')} style=${b ? 'font-weight:800' : ''}>${v}</span></div>`;
 }
 
-function TaxView({ store, openProfile }) {
+function TaxView({ store, openProfile, openTx }) {
   const d = store.data, P = d.settings.tax || {}, cur = Number(todayIso().slice(0, 4));
   const [N, setN] = useState(cur);
   const r = useMemo(() => (P.regime === 'forfettario' || P.regime === 'ordinario') ? computeTax(d, P, N) : null, [store.st.version, N]);
@@ -995,6 +995,18 @@ function TaxView({ store, openProfile }) {
       <${Row} l=${'Già versati per il ' + N} v=${'−' + eur(r.contribPerN)} />
       <${Row} l="Conguaglio previsto" v=${eur(r.conguaglio)} b cls=${r.conguaglio < 0 ? 'in' : ''} />
     </div>`}
+    <div class="sec">Versamenti registrati</div>
+    ${(() => {
+      const list = live(d.transactions).filter(t => t.kind === 'expense' && !isAdj(t)).map(t => ({ t, ti: taxInfo(t, d, P) }))
+        .filter(x => x.ti && (x.ti.year === N || x.t.date.startsWith(String(N)))).sort((a, b) => a.t.date.localeCompare(b.t.date));
+      if (!list.length) return html`<div class="empty">Nessun versamento di tasse o contributi riferito al ${N} o pagato nel ${N}.</div>`;
+      return html`<div class="list">${list.map(({ t, ti }) => html`<button class="row" onClick=${() => openTx(t)}>
+        <i class="dot" style=${'--c:' + (d.categories[t.category_id]?.color || '#999')}></i>
+        <div class="mid"><div class="t">${d.categories[t.category_id]?.name || 'Versamento'} <span class="tag">${ti.part === 'saldo' ? 'saldo' : ti.part === 'altro' ? 'altro' : 'acconto'} ${ti.year}</span></div>
+          <div class="s">pagato il ${shortDate(t.date)}${t.note ? ', ' + t.note : ''}</div></div>
+        <div class="amt num tx">${eur(t.amount)}</div></button>`)}</div>
+        <p class="hint">Tocca un versamento per correggere data, tipo o anno di riferimento.</p>`;
+    })()}
     <p class="hint">È una stima basata sui movimenti registrati e sui parametri del profilo. Non sostituisce il calcolo del commercialista.</p>
     <button class="btn sec2" onClick=${openProfile}>Modifica profilo fiscale</button>
   </div>`;
@@ -1110,7 +1122,7 @@ function Main({ user }) {
     ${tab === 'mov' && html`<${Movements} store=${store} openTx=${t => setSheet({ k: 'tx', v: t })} goTab=${setTab} />`}
     ${tab === 'charts' && html`<${Charts} store=${store} />`}
     ${tab === 'rec' && html`<${Recurring} store=${store} openRec=${r => setSheet({ k: 'rec', v: r })} />`}
-    ${tab === 'tax' && html`<${TaxView} store=${store} openProfile=${() => setSheet({ k: 'taxprofile' })} />`}
+    ${tab === 'tax' && html`<${TaxView} store=${store} openProfile=${() => setSheet({ k: 'taxprofile' })} openTx=${t => setSheet({ k: 'tx', v: t })} />`}
     ${tab === 'set' && html`<${Settings} store=${store} user=${user} open=${k => setSheet({ k })} />`}
     ${(tab === 'mov' || tab === 'charts' || tab === 'tax') && html`<button class="fab" onClick=${() => setSheet({ k: 'tx', v: {} })}>+ Movimento</button>`}
     <nav class="tabs"><div class="in2">${TABS.map(([k, ic, l]) => html`<button class=${tab === k ? 'on' : ''} aria-current=${tab === k ? 'page' : null} onClick=${() => setTab(k)}><span aria-hidden="true">${ic}</span>${l}</button>`)}</div></nav>
