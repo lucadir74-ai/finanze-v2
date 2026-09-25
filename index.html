@@ -174,7 +174,7 @@ const addMonths = (ym, n) => { const [y, m] = ym.split('-').map(Number); const d
 const daysIn = (y, m) => new Date(y, m, 0).getDate();
 const dayLabel = iso => { const [y, m, d] = iso.split('-').map(Number); return new Date(y, m - 1, d).toLocaleDateString('it-IT', { weekday: 'short', day: 'numeric', month: 'short' }); };
 const shortDate = iso => { const [y, m, d] = iso.split('-').map(Number); return `${d} ${MSHORT[m - 1]} ${y}`; };
-const parseAmt = s => { s = String(s ?? '').trim().replace(/[\s€]/g, ''); if (!s) return NaN; if (s.includes(',')) s = s.replace(/\./g, '').replace(',', '.'); return Number(s); };
+const parseAmt = s => { s = String(s ?? '').trim().replace(/[\s€]/g, ''); if (!s) return NaN; if (s.includes(',')) s = s.replace(/\./g, '').replace(',', '.'); else if (/^-?[1-9]\d{0,2}(\.\d{3})+$/.test(s)) s = s.replace(/\./g, ''); return Number(s); };
 const round2 = v => Math.round((Number(v) + Number.EPSILON) * 100) / 100;
 const fmtIn = v => (v === null || v === undefined || v === '') ? '' : String(v).replace('.', ',');
 const uuid = () => (crypto.randomUUID ? crypto.randomUUID() : 'id' + Date.now().toString(36) + Math.random().toString(36).slice(2));
@@ -236,6 +236,7 @@ function pendingReminders(d) {
   }
   return out.sort((a, b) => a.date.localeCompare(b.date));
 }
+const isAdj = t => String(t.id).startsWith('adj:');
 const txFromRec = (r, date, id) => ({ id, date, kind: r.kind, amount: r.amount, account_id: r.account_id, to_account_id: r.kind === 'transfer' ? r.to_account_id : null, category_id: r.kind === 'transfer' ? null : r.category_id, note: r.note, invoiced: r.kind === 'income' && !!r.invoiced, recurring_id: r.id, deleted: false });
 
 // ====================================================================
@@ -537,7 +538,7 @@ function TxForm({ store, tx, onClose }) {
     if (!(a > 0)) return setErr('Inserisci un importo maggiore di zero.');
     if (!acc) return setErr('Scegli il conto.');
     if (kind === 'transfer' && (!toAcc || toAcc === acc)) return setErr('Scegli un conto di destinazione diverso da quello di partenza.');
-    if (kind !== 'transfer' && !cat) return setErr('Scegli una voce.');
+    if (kind !== 'transfer' && !cat && !isAdj(tx)) return setErr('Scegli una voce.');
     if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return setErr('Inserisci una data valida.');
     const isPos = kind === 'income' && pos;
     store.upsert('transactions', { ...tx, id: tx.id || uuid(), date, kind, amount: round2(a), account_id: acc, to_account_id: kind === 'transfer' ? toAcc : null, category_id: kind === 'transfer' ? null : cat, note: note.trim() || null, invoiced: kind === 'income' && invoiced, pos: isPos, pos_pct: isPos ? pct : null, pos_fixed: isPos ? fix : null, pos_fee: isPos ? fee : null, deleted: false });
@@ -569,7 +570,7 @@ function TxForm({ store, tx, onClose }) {
 // ---------- riga movimento ----------
 function TxRow({ store, t, onOpen }) {
   const d = store.data, c = d.categories[t.category_id], a = d.accounts[t.account_id], to = d.accounts[t.to_account_id];
-  const title = t.kind === 'transfer' ? 'Giroconto' : (c?.name || 'Senza voce');
+  const title = isAdj(t) ? 'Rettifica saldo' : t.kind === 'transfer' ? 'Giroconto' : (c?.name || 'Senza voce');
   const sub = t.kind === 'transfer' ? `${a?.name || '?'} → ${to?.name || '?'}` : [a?.name, t.note].filter(Boolean).join(', ');
   const cls = t.kind === 'income' ? 'in' : t.kind === 'transfer' ? 'mut' : (c?.scope === 'tax' ? 'tx' : 'out');
   const sign = t.kind === 'income' ? '+' : t.kind === 'expense' ? '−' : '';
@@ -592,7 +593,7 @@ function Movements({ store, openTx, goTab }) {
   const reminders = useMemo(() => pendingReminders(d), [store.st.version]);
   const txs = useMemo(() => live(d.transactions).filter(t => ymOf(t.date) === ym && (!fAcc || t.account_id === fAcc || t.to_account_id === fAcc) && (!fCat || t.category_id === fCat))
     .sort((a, b) => b.date.localeCompare(a.date) || String(b.updated_at).localeCompare(String(a.updated_at))), [store.st.version, ym, fAcc, fCat]);
-  let inc = 0, exp = 0; for (const t of txs) { if (t.kind === 'income') { inc += +t.amount; exp += +(t.pos_fee || 0); } else if (t.kind === 'expense') exp += +t.amount; }
+  let inc = 0, exp = 0; for (const t of txs) { if (isAdj(t)) continue; if (t.kind === 'income') { inc += +t.amount; exp += +(t.pos_fee || 0); } else if (t.kind === 'expense') exp += +t.amount; }
   const days = []; for (const t of txs) { const last = days[days.length - 1]; if (last && last.date === t.date) last.items.push(t); else days.push({ date: t.date, items: [t] }); }
   const cats = live(d.categories).sort(bySort);
 
@@ -626,14 +627,14 @@ function Charts({ store }) {
   const data = useMemo(() => {
     const ex = {}, inc = {}, scope = { pro: 0, personal: 0, tax: 0 }; let posFees = 0;
     for (const t of live(d.transactions)) {
-      if (!inPeriod(t) || t.kind === 'transfer') continue;
+      if (!inPeriod(t) || t.kind === 'transfer' || isAdj(t)) continue;
       const c = d.categories[t.category_id], key = t.category_id || '_none';
       if (t.kind === 'expense') { ex[key] = (ex[key] || 0) + +t.amount; scope[c?.scope || 'personal'] += +t.amount; }
       else { inc[key] = (inc[key] || 0) + +t.amount; if (t.pos_fee) { posFees += +t.pos_fee; scope.pro += +t.pos_fee; } }
     }
     const toRows = o => Object.entries(o).map(([id, v]) => ({ name: d.categories[id]?.name || 'Senza voce', color: d.categories[id]?.color, v: round2(v) })).sort((a, b) => b.v - a.v);
     const exRows = toRows(ex); if (posFees) { exRows.push({ name: 'Commissioni POS', color: '#4B5563', v: round2(posFees) }); exRows.sort((a, b) => b.v - a.v); }
-    const trend = []; for (let i = 11; i >= 0; i--) { const m = addMonths(ym, -i); let a = 0, b = 0; for (const t of live(d.transactions)) { if (ymOf(t.date) !== m) continue; if (t.kind === 'income') { a += +t.amount; b += +(t.pos_fee || 0); } else if (t.kind === 'expense') b += +t.amount; } trend.push({ m, a, b }); }
+    const trend = []; for (let i = 11; i >= 0; i--) { const m = addMonths(ym, -i); let a = 0, b = 0; for (const t of live(d.transactions)) { if (ymOf(t.date) !== m || isAdj(t)) continue; if (t.kind === 'income') { a += +t.amount; b += +(t.pos_fee || 0); } else if (t.kind === 'expense') b += +t.amount; } trend.push({ m, a, b }); }
     return { exRows, inRows: toRows(inc), scope, trend };
   }, [store.st.version, ym, mode]);
   const exTot = data.exRows.reduce((s, r) => s + r.v, 0), inTot = data.inRows.reduce((s, r) => s + r.v, 0);
@@ -742,6 +743,15 @@ function AccountsEditor({ store, onClose }) {
   <//>`;
 }
 function AccountForm({ store, acc, onDone, onClose }) {
+  const curBal = acc.id ? (balances(store.data)[acc.id] ?? 0) : 0;
+  const [real, setReal] = useState(''), [adjMsg, setAdjMsg] = useState('');
+  const adjust = () => {
+    const target = parseAmt(real); if (Number.isNaN(target)) return setAdjMsg('Scrivi il saldo reale, per esempio 1.180,50');
+    const diff = round2(target - curBal); if (Math.abs(diff) < 0.005) return setAdjMsg('Il saldo è già corretto.');
+    if (!confirm(`Registrare una rettifica di ${diff > 0 ? '+' : '−'}${eur(Math.abs(diff))} con data di oggi, così il saldo diventa ${eur(target)}?`)) return;
+    store.upsert('transactions', { id: 'adj:' + uuid(), date: todayIso(), kind: diff > 0 ? 'income' : 'expense', amount: Math.abs(diff), account_id: acc.id, category_id: null, note: 'Rettifica saldo', deleted: false });
+    setReal(''); setAdjMsg(`Fatto: il saldo ora è ${eur(target)}.`);
+  };
   const isNew = !acc.id, used = !isNew && live(store.data.transactions).some(t => t.account_id === acc.id || t.to_account_id === acc.id);
   const [name, setName] = useState(acc.name || ''), [icon, setIcon] = useState(acc.icon ?? '🏦'), [color, setColor] = useState(acc.color || COLORS[live(store.data.accounts).length % COLORS.length]);
   const [init, setInit] = useState(fmtIn(acc.initial_balance ?? '')), [archived, setArchived] = useState(!!acc.archived), [err, setErr] = useState('');
@@ -755,8 +765,13 @@ function AccountForm({ store, acc, onDone, onClose }) {
     <button class="linkbtn" onClick=${onDone}>‹ Tutti i conti</button>
     <div class="two" style="grid-template-columns:80px 1fr"><label class="f"><span>Icona</span><input class="i" value=${icon} onInput=${e => setIcon(e.target.value)} maxlength="4" style="text-align:center" /></label>
       <label class="f"><span>Nome</span><input class="i" value=${name} onInput=${e => setName(e.target.value)} placeholder="Es. Banca, Carta prepagata" /></label></div>
+    ${!isNew && html`<div class="card" style="margin-top:14px"><div class="mut" style="font-size:.85rem">Saldo attuale in app</div><div class="num" style="font-size:1.5rem;font-weight:800">${eur(curBal)}</div>
+      <${AmountField} label="Saldo reale (quello che vedi in banca)" value=${real} onInput=${setReal} />
+      <button class="btn sec2" onClick=${adjust}>Correggi saldo</button>
+      <p class="hint">Aggiunge un movimento “Rettifica saldo” con la differenza. Non conta nelle entrate, nelle uscite e nei grafici, e se serve puoi eliminarlo dai movimenti.</p>
+      ${adjMsg && html`<div class="okmsg">${adjMsg}</div>`}</div>`}
     <${AmountField} label="Saldo iniziale" value=${init} onInput=${setInit} />
-    <p class="hint">È il saldo del conto prima del primo movimento che registri qui.</p>
+    <p class="hint">${isNew ? 'Quanto c’è sul conto adesso, prima di registrare movimenti.' : 'Il saldo di partenza, prima di tutti i movimenti registrati. Per allineare il conto alla banca usa “Correggi saldo” qui sopra.'}</p>
     <label class="f"><span>Colore</span><div class="swatches">${COLORS.map(c => html`<button type="button" class=${'sw' + (c === color ? ' on' : '')} style=${'--c:' + c} aria-label=${'Colore ' + c} onClick=${() => setColor(c)}></button>`)}</div></label>
     ${!isNew && html`<label class="check"><input type="checkbox" checked=${archived} onChange=${e => setArchived(e.target.checked)} />Archiviato (non compare più nelle scelte)</label>`}
     ${err && html`<div class="err" role="alert">${err}</div>`}
