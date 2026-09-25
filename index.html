@@ -600,7 +600,7 @@ function Movements({ store, openTx, goTab }) {
   const bal = useMemo(() => balances(d), [store.st.version]);
   const accs = live(d.accounts).filter(a => !a.archived || Math.abs(bal[a.id] || 0) > 0.004).sort(bySort);
   const total = Object.values(bal).reduce((x, y) => x + y, 0);
-  const reminders = useMemo(() => pendingReminders(d), [store.st.version]);
+  const reminders = useMemo(() => [...pendingReminders(d), ...taxWindows(d).due], [store.st.version]);
   const txs = useMemo(() => live(d.transactions).filter(t => ymOf(t.date) === ym && (!fAcc || t.account_id === fAcc || t.to_account_id === fAcc) && (!fCat || t.category_id === fCat))
     .sort((a, b) => b.date.localeCompare(a.date) || String(b.updated_at).localeCompare(String(a.updated_at))), [store.st.version, ym, fAcc, fCat]);
   let inc = 0, exp = 0; for (const t of txs) { if (isAdj(t)) continue; if (t.kind === 'income') { inc += +t.amount; exp += +(t.pos_fee || 0); } else if (t.kind === 'expense') exp += +t.amount; }
@@ -721,14 +721,19 @@ function RecForm({ store, rec, onClose }) {
 function Recurring({ store, openRec }) {
   const d = store.data, today = todayIso();
   const reminders = useMemo(() => pendingReminders(d), [store.st.version]);
+  const tw = useMemo(() => taxWindows(d), [store.st.version]);
   const recs = live(d.recurring).sort((a, b) => (nextOccurrence(a, today) || '9').localeCompare(nextOccurrence(b, today) || '9'));
   const register = p => { const amt = prompt(`Importo per ${p.r.note || d.categories[p.r.category_id]?.name || 'questa voce'}`, fmtIn(p.r.amount)); if (amt === null) return; const a = parseAmt(amt); if (!(a >= 0)) return alert('Importo non valido.'); store.upsert('transactions', { ...txFromRec(p.r, p.date, p.id), amount: round2(a) }); };
   const skip = p => { if (confirm('Segnare come da non registrare? Non verrà più proposto.')) store.upsert('transactions', { ...txFromRec(p.r, p.date, p.id), deleted: true }); };
   return html`<div>
-    ${reminders.length > 0 && html`<div class="sec">Da registrare</div><div class="list">${reminders.map(p => html`<div class="row" style="cursor:default">
+    ${(reminders.length > 0 || tw.due.length > 0) && html`<div class="sec">Da registrare</div>`}
+    ${tw.due.length > 0 && html`<div class="list" style="margin-bottom:8px">${tw.due.map(dl => html`<${DeadlineRow} key=${dl.id} store=${store} dl=${dl} past=${dl.date <= today} />`)}</div>`}
+    ${reminders.length > 0 && html`<div class="list">${reminders.map(p => html`<div class="row" style="cursor:default">
       <i class="dot" style=${'--c:' + (d.categories[p.r.category_id]?.color || '#999')}></i>
       <div class="mid"><div class="t">${p.r.note || d.categories[p.r.category_id]?.name || 'Ricorrenza'}</div><div class="s">scadenza ${shortDate(p.date)}, ${eur(p.r.amount)}</div></div>
       <button class="chip" onClick=${() => register(p)}>Registra</button><button class="linkbtn" onClick=${() => skip(p)} aria-label="Ignora">Ignora</button></div>`)}</div>`}
+    ${tw.upcoming.length > 0 && html`<div class="sec">Prossime scadenze fiscali</div><div class="list">${tw.upcoming.map(dl => html`<${DeadlineRow} key=${dl.id} store=${store} dl=${dl} />`)}</div>
+      <p class="hint">Calcolate dal profilo fiscale e dalla stima della scheda Tasse. Quando paghi, premi Registra e correggi l’importo con quello dell’F24 o dell’avviso: acconto, saldo e anno si impostano da soli.</p>`}
     <div class="sec">Ricorrenze</div>
     ${recs.length === 0 ? html`<div class="empty">Aggiungi qui affitto, abbonamenti, stipendio o scadenze annuali come l’assicurazione.</div>`
       : html`<div class="list">${recs.map(r => { const c = d.categories[r.category_id], nx = r.active ? nextOccurrence(r, today) : null; return html`<button class="row" onClick=${() => openRec(r)}>
@@ -953,6 +958,74 @@ function computeTax(d, P, N) {
   const juneEnd = new Date(N + 1, 5, 30), months = Math.max(1, Math.round((juneEnd - new Date()) / (30.44 * 864e5)));
   r.mesi = months; r.alMese = (r.giugno + Math.max(0, r.conguaglio)) / months; r.juneFuture = juneEnd > new Date();
   return r;
+}
+
+// ---------- scadenze fiscali (generate dal profilo e dalla stima) ----------
+function taxDeadlines(d) {
+  const P = d.settings.tax || {}, piva = P.regime === 'forfettario' || P.regime === 'ordinario';
+  if (!piva && P.cassa !== 'enpab') return [];
+  const today = todayIso(), cur = Number(today.slice(0, 4)), out = [];
+  const infos = live(d.transactions).filter(t => t.kind === 'expense').map(t => ({ t, ti: taxInfo(t, d, P) })).filter(x => x.ti);
+  const cache = {}; const ct = y => (y in cache ? cache[y] : (cache[y] = piva ? computeTax(d, P, y) : null));
+  const known = r => r && r.hasData;
+  const first = num(P.prima_rata ?? 40) / 100;
+  const isContr = x => x.ti.role === 'contributi' || x.ti.role === 'integrativo';
+  for (const Y of [cur, cur + 1]) {
+    const base = ct(Y - 1);
+    if (piva) {
+      const acc = infos.filter(x => x.ti.role === 'imposta' && x.ti.part === 'acconto' && x.ti.year === Y);
+      const paid1 = acc.filter(x => x.t.date <= `${Y}-10-31`).reduce((a, x) => a + +x.t.amount, 0) + num(P.opening?.[String(Y)]?.acconti);
+      const saldoAmt = known(base) ? Math.max(0, round2(base.saldo)) : null;
+      let acc1 = known(base) ? round2(base.acc1) : null, acc2 = known(base) ? round2(base.acc2) : null;
+      if (acc2 === null && paid1 > 0 && first > 0 && first < 1) acc2 = round2(paid1 * (1 - first) / first);
+      if (saldoAmt !== 0) out.push({ id: `tax:imp-saldo:${Y - 1}`, date: `${Y}-06-30`, label: `Saldo imposta ${Y - 1}`, amount: saldoAmt, role: 'imposta', part: 'saldo', year: Y - 1, done: infos.some(x => x.ti.role === 'imposta' && x.ti.part === 'saldo' && x.ti.year === Y - 1) });
+      if (acc1 !== 0) out.push({ id: `tax:imp-acc1:${Y}`, date: `${Y}-06-30`, label: `1° acconto imposta ${Y}`, amount: acc1, role: 'imposta', part: 'acconto', year: Y, done: paid1 > 0 });
+      if (acc2 !== 0) out.push({ id: `tax:imp-acc2:${Y}`, date: `${Y}-11-30`, label: `2° acconto imposta ${Y}`, amount: acc2, role: 'imposta', part: 'acconto', year: Y, done: acc.some(x => x.t.date > `${Y}-10-31`) });
+    }
+    if (P.cassa === 'enpab') {
+      const cv = { ...CASSE.enpab, ...(P.cassaVals || {}) }, min = num(cv.soggMin) + num(cv.integMin) + num(cv.fissi);
+      const nAcc = infos.filter(x => isContr(x) && x.ti.part === 'acconto' && x.ti.year === Y).length;
+      if (min > 0) {
+        out.push({ id: `tax:enpab-min1:${Y}`, date: `${Y}-04-30`, label: `Minimi ENPAB ${Y}, 1ª rata`, amount: round2(min / 2), role: 'contributi', part: 'acconto', year: Y, done: nAcc >= 1 });
+        out.push({ id: `tax:enpab-min2:${Y}`, date: `${Y}-06-30`, label: `Minimi ENPAB ${Y}, 2ª rata`, amount: round2(min / 2), role: 'contributi', part: 'acconto', year: Y, done: nAcc >= 2 });
+      }
+      const cong = known(base) ? Math.max(0, round2(base.conguaglio)) : null;
+      if (cong !== 0) out.push({ id: `tax:enpab-cong:${Y - 1}`, date: `${Y}-10-31`, label: `Conguaglio ENPAB ${Y - 1}`, hint: 'anche in 4 rate fino a febbraio', amount: cong, role: 'contributi', part: 'saldo', year: Y - 1, done: infos.some(x => isContr(x) && x.ti.part === 'saldo' && x.ti.year === Y - 1) });
+    }
+  }
+  return out.filter(x => !x.done && !d.transactions[x.id]).sort((a, b) => a.date.localeCompare(b.date));
+}
+function taxWindows(d) {
+  const all = taxDeadlines(d), today = todayIso();
+  const from = isoDate(new Date(Date.now() - 45 * 864e5)), soon = isoDate(new Date(Date.now() + 15 * 864e5)), far = isoDate(new Date(Date.now() + 366 * 864e5));
+  return { due: all.filter(x => x.date >= from && x.date <= soon), upcoming: all.filter(x => x.date > soon && x.date <= far) };
+}
+function taxCatFor(store, role) {
+  const d = store.data, P = d.settings.tax || {};
+  const cands = live(d.categories).filter(c => c.scope === 'tax' && !c.archived && roleOfCat(c, P) === role).sort(bySort);
+  const c = role === 'contributi' ? (cands.find(x => /enpab/i.test(x.name)) || cands[0]) : cands[0];
+  if (c) return c.id;
+  const id = uuid();
+  store.upsert('categories', { id, name: role === 'imposta' ? (P.regime === 'ordinario' ? 'IRPEF' : 'Imposta sostitutiva') : 'Contributi ENPAB', kind: 'expense', scope: 'tax', color: COLORS[role === 'imposta' ? 5 : 8], sort: 900 });
+  return id;
+}
+function registerDeadline(store, dl) {
+  const amt = prompt(`${dl.label}: importo pagato\n(se una parte è stata compensata con crediti, scrivi solo quanto è uscito dal conto e aggiungi il resto in Tasse → totali)`, dl.amount != null ? fmtIn(dl.amount) : '');
+  if (amt === null) return;
+  const a = parseAmt(amt); if (!(a > 0)) return alert('Importo non valido.');
+  const d = store.data, s = d.settings, today = todayIso();
+  const acc = (d.accounts[s.last_account] && !d.accounts[s.last_account].deleted && s.last_account) || live(d.accounts).filter(x => !x.archived).sort(bySort)[0]?.id;
+  store.upsert('transactions', { id: dl.id, date: today < dl.date ? today : dl.date, kind: 'expense', amount: round2(a), account_id: acc, category_id: taxCatFor(store, dl.role), note: dl.label, tax_part: dl.part, tax_year: dl.year, deleted: false });
+}
+function skipDeadline(store, dl) {
+  if (!confirm(`Non registrare "${dl.label}"? Non verrà più proposto (per esempio se l’hai già registrato in altro modo o non era dovuto).`)) return;
+  store.upsert('transactions', { id: dl.id, date: dl.date, kind: 'expense', amount: 0, note: dl.label, tax_part: dl.part, tax_year: dl.year, deleted: true });
+}
+function DeadlineRow({ store, dl, past }) {
+  return html`<div class="row" style="cursor:default">
+    <i class="dot" style="--c:var(--tax)"></i>
+    <div class="mid"><div class="t">${dl.label}</div><div class="s">${past ? 'scadenza' : 'entro il'} ${shortDate(dl.date)}, ${dl.amount != null ? 'stima ' + eur(dl.amount) : 'importo dall’avviso'}${dl.hint ? ', ' + dl.hint : ''}</div></div>
+    <button class="chip" onClick=${() => registerDeadline(store, dl)}>Registra</button><button class="linkbtn" onClick=${() => skipDeadline(store, dl)}>Ignora</button></div>`;
 }
 
 function Row({ l, v, b, cls, hint }) {
