@@ -190,7 +190,7 @@ const TABLES = ['accounts', 'categories', 'transactions', 'recurring'];
 const COLS = {
   accounts: { user_id: null, id: null, name: '', icon: null, color: null, initial_balance: 0, sort: 0, archived: false, deleted: false },
   categories: { user_id: null, id: null, name: '', kind: 'expense', scope: 'personal', color: null, sort: 0, archived: false, deleted: false },
-  transactions: { user_id: null, id: null, date: null, kind: 'expense', amount: 0, account_id: null, to_account_id: null, category_id: null, note: null, invoiced: false, pos: false, pos_pct: null, pos_fixed: null, pos_fee: null, recurring_id: null, deleted: false },
+  transactions: { user_id: null, id: null, date: null, kind: 'expense', amount: 0, account_id: null, to_account_id: null, category_id: null, note: null, invoiced: false, pos: false, pos_pct: null, pos_fixed: null, pos_fee: null, recurring_id: null, tax_year: null, tax_part: null, deleted: false },
   recurring: { user_id: null, id: null, kind: 'expense', amount: 0, account_id: null, to_account_id: null, category_id: null, note: null, freq: 'monthly', day: 1, month: null, start_date: null, auto: true, active: true, invoiced: false, deleted: false },
 };
 const clean = (t, r) => { const o = {}; for (const [c, def] of Object.entries(COLS[t])) o[c] = r[c] === undefined ? def : r[c]; return o; };
@@ -253,6 +253,7 @@ function createStore(uid) {
   const emit = () => { st.version++; subs.forEach(f => f()); };
   const persist = () => { const a = lsSet(kC, data), b = lsSet(kQ, queue); st.cacheOk = a && b; };
   const enqueue = (table, id, row) => { queue = queue.filter(q => !(q.table === table && q.id === id)); queue.push({ table, id, row }); };
+  let noTaxCols = false;
   let timer = null; const schedule = () => { clearTimeout(timer); timer = setTimeout(flush, 350); };
 
   function upsertMany(table, rows) {
@@ -279,8 +280,9 @@ function createStore(uid) {
         } else {
           const batch = [];
           for (const q of queue) { if (q.table !== first.table || batch.length >= 300) break; batch.push(q); }
-          const rows = batch.map(q => { const r = clean(q.table, q.row); r.user_id = uid; return r; });
+          const rows = batch.map(q => { const r = clean(q.table, q.row); r.user_id = uid; if (noTaxCols && q.table === 'transactions') { delete r.tax_year; delete r.tax_part; } return r; });
           const { error } = await sb.from(first.table).upsert(rows, { onConflict: 'user_id,id' });
+          if (error && !noTaxCols && first.table === 'transactions' && /tax_(year|part)/.test(error.message || '')) { noTaxCols = true; continue; }
           if (error) throw error;
           const sent = new Set(batch); queue = queue.filter(q => !sent.has(q));
         }
@@ -530,7 +532,11 @@ function TxForm({ store, tx, onClose }) {
   const [posPct, setPosPct] = useState(fmtIn(tx.pos_pct ?? s.pos_pct ?? ''));
   const [posFixed, setPosFixed] = useState(fmtIn(tx.pos_fixed ?? s.pos_fixed ?? ''));
   const [err, setErr] = useState('');
+  const [taxPart, setTaxPart] = useState(tx.tax_part || 'acconto');
+  const [taxYear, setTaxYear] = useState(tx.tax_year ? String(tx.tax_year) : '');
   useEffect(() => { const c = d.categories[cat]; if (c && c.kind !== kind) setCat(''); }, [kind]);
+  const isTaxCat = kind === 'expense' && d.categories[cat]?.scope === 'tax';
+  const defYear = p => String(Number((date || todayIso()).slice(0, 4)) - (p === 'saldo' ? 1 : 0));
   const a = parseAmt(amount), pct = parseAmt(posPct) || 0, fix = parseAmt(posFixed) || 0;
   const fee = kind === 'income' && pos && a > 0 ? round2(a * pct / 100 + fix) : 0;
 
@@ -541,7 +547,7 @@ function TxForm({ store, tx, onClose }) {
     if (kind !== 'transfer' && !cat && !isAdj(tx)) return setErr('Scegli una voce.');
     if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return setErr('Inserisci una data valida.');
     const isPos = kind === 'income' && pos;
-    store.upsert('transactions', { ...tx, id: tx.id || uuid(), date, kind, amount: round2(a), account_id: acc, to_account_id: kind === 'transfer' ? toAcc : null, category_id: kind === 'transfer' ? null : cat, note: note.trim() || null, invoiced: kind === 'income' && invoiced, pos: isPos, pos_pct: isPos ? pct : null, pos_fixed: isPos ? fix : null, pos_fee: isPos ? fee : null, deleted: false });
+    store.upsert('transactions', { ...tx, id: tx.id || uuid(), date, kind, amount: round2(a), account_id: acc, to_account_id: kind === 'transfer' ? toAcc : null, category_id: kind === 'transfer' ? null : cat, note: note.trim() || null, invoiced: kind === 'income' && invoiced, pos: isPos, pos_pct: isPos ? pct : null, pos_fixed: isPos ? fix : null, pos_fee: isPos ? fee : null, tax_part: isTaxCat ? taxPart : null, tax_year: isTaxCat ? (Number(taxYear) || Number(defYear(taxPart))) : null, deleted: false });
     const patch = {}; if (s.last_account !== acc) patch.last_account = acc; if (kind === 'income' && s.default_invoiced !== invoiced) patch.default_invoiced = invoiced;
     if (Object.keys(patch).length) store.setSettings(patch);
     onClose();
@@ -560,6 +566,9 @@ function TxForm({ store, tx, onClose }) {
     ${kind === 'transfer' ? html`<${AccountSelect} store=${store} value=${toAcc} onChange=${setToAcc} exclude=${acc} label="A conto" />`
       : html`<div class="f" style="margin-top:14px"><span style="font-size:.82rem;color:var(--muted);font-weight:600">Voce</span><${CategoryPicker} store=${store} kind=${kind} value=${cat} onPick=${setCat} /></div>`}
     ${kind === 'income' && html`<label class="check"><input type="checkbox" checked=${invoiced} onChange=${e => setInvoiced(e.target.checked)} />Con fattura</label>`}
+    ${isTaxCat && html`<label class="f"><span>Questo versamento è</span><div class="seg">${[['acconto', 'Acconto'], ['saldo', 'Saldo'], ['altro', 'Altro']].map(([k, l]) => html`<button type="button" class=${taxPart === k ? 'on' : ''} onClick=${() => setTaxPart(k)}>${l}</button>`)}</div></label>
+      <label class="f"><span>Anno dei redditi a cui si riferisce</span><input class="i num" inputmode="numeric" value=${taxYear || defYear(taxPart)} onInput=${e => setTaxYear(e.target.value)} /></label>
+      <p class="hint">Esempio: a giugno 2026 il saldo è per i redditi 2025, gli acconti per i redditi 2026.</p>`}
     <label class="f"><span>Nota (facoltativa)</span><input class="i" value=${note} onInput=${e => setNote(e.target.value)} placeholder="Es. nome paziente, negozio…" /></label>
     ${err && html`<div class="err" role="alert">${err}</div>`}
     <button class="btn" onClick=${save}>${isNew ? 'Aggiungi movimento' : 'Salva modifiche'}</button>
@@ -839,6 +848,216 @@ function Snapshots({ store, onClose }) {
   <//>`;
 }
 
+// ====================================================================
+//  TASSE E CONTRIBUTI
+//  Valori suggeriti e relative fonti (da ricontrollare ogni anno):
+//  - forfettario: imposta sostitutiva 15% (Agenzia Entrate, scheda regime forfetario),
+//    5% per nuove attività con i requisiti; coefficienti: Allegato 2 L. 145/2018.
+//  - IRPEF 2026: 23% fino a 28.000, 33% fino a 50.000, 43% oltre (L. 199/2025).
+//  - INPS Gestione Separata 2026: 26,07% (24% se già coperti altrove), massimale 122.295 (circ. INPS 8/2026).
+//  - ENPAB: soggettivo 15% (fino al 36%), integrativo 4%, maternità 136 € (FAQ ENPAB).
+//  - Acconti: metodo storico 100% dell'imposta dell'anno prima; nessun acconto sotto 51,65 €,
+//    unica rata a novembre sotto 257,52 €; ripartizione 40/60 (50/50 per i soggetti ISA: da verificare).
+// ====================================================================
+const COEFF = [[40, 'Alimentari, commercio, alloggio e ristorazione'], [54, 'Commercio ambulante non alimentare'], [62, 'Intermediari del commercio'], [67, 'Altre attività economiche'], [78, 'Professionali, scientifiche, tecniche, sanitarie, istruzione, finanza'], [86, 'Costruzioni e immobiliare']];
+const IRPEF = [[28000, 23], [50000, 33], [Infinity, 43]];
+const CASSE = {
+  enpab: { label: 'ENPAB (biologi)', sogg: 15, soggMin: 1309, integ: 4, integMin: 106, fissi: 136, massimale: 0,
+    fonte: 'Aliquote 15% e 4% e maternità 136 €: FAQ ENPAB. I minimi 2026 (1.309 € e 106 €) vengono da fonti di settore e NON sono verificati sul sito ENPAB: controllali lì.' },
+  inps_gs: { label: 'INPS Gestione Separata', sogg: 26.07, soggMin: 0, integ: 0, integMin: 0, fissi: 0, massimale: 122295,
+    fonte: 'Circolare INPS n. 8/2026: 26,07% per i professionisti senza altra copertura (24% se pensionati o già iscritti altrove), massimale 122.295 €. Nessun contributo minimo.' },
+  altra: { label: 'Altra cassa (inserisco io)', sogg: 0, soggMin: 0, integ: 0, integMin: 0, fissi: 0, massimale: 0, fonte: 'Inserisci i valori del regolamento della tua cassa.' },
+  nessuna: { label: 'Nessuna cassa', sogg: 0, soggMin: 0, integ: 0, integMin: 0, fissi: 0, massimale: 0, fonte: '' },
+};
+const TAX_ROLES = { imposta: 'Imposta', contributi: 'Contributi deducibili', integrativo: 'Contributo integrativo', altro: 'Altro (bollo, ecc.)' };
+const pct = v => String(round2(v)).replace('.', ',') + '%';
+const num = v => { const n = parseAmt(v); return Number.isNaN(n) ? 0 : n; };
+
+function roleOfCat(c, P) {
+  if (!c || c.scope !== 'tax') return null;
+  const r = P.roles?.[c.id]; if (r) return r;
+  const n = c.name.toLowerCase();
+  if (/integrativ/.test(n)) return 'integrativo';
+  if (/bollo/.test(n)) return 'altro';
+  if (/impost|irpef|sostitutiv|tasse|addizional/.test(n)) return 'imposta';
+  if (/enpab|inps|contribut|cassa|previden|soggettiv|maternit|minimal/.test(n)) return 'contributi';
+  return 'altro';
+}
+function taxInfo(t, d, P) {
+  const c = d.categories[t.category_id]; let role = roleOfCat(c, P); if (!role) return null;
+  if (role === 'contributi' && /integrativ/i.test(t.note || '')) role = 'integrativo';
+  const part = t.tax_part || (/^saldo/i.test(t.note || '') ? 'saldo' : 'acconto');
+  const year = Number(t.tax_year) || (Number(t.date.slice(0, 4)) - (part === 'saldo' ? 1 : 0));
+  return { role, part, year };
+}
+function irpef(imp) { let tax = 0, prev = 0; for (const [lim, rate] of IRPEF) { if (imp <= prev) break; tax += (Math.min(imp, lim) - prev) * rate / 100; prev = lim; } return tax; }
+
+function computeTax(d, P, N) {
+  const Y = String(N), today = todayIso(), cur = Number(today.slice(0, 4));
+  const txs = live(d.transactions).filter(t => !isAdj(t));
+  const onlyInv = P.only_invoiced !== false;
+  let incassi = 0, spese = 0, contribPagatiN = 0, accontiN = 0, contribPerN = 0;
+  for (const t of txs) {
+    const c = d.categories[t.category_id], inYear = t.date.startsWith(Y);
+    if (inYear && t.kind === 'income' && c?.scope === 'pro' && (!onlyInv || t.invoiced)) { incassi += +t.amount; spese += +(t.pos_fee || 0); }
+    if (inYear && t.kind === 'expense' && c?.scope === 'pro') spese += +t.amount;
+    const ti = t.kind === 'expense' ? taxInfo(t, d, P) : null;
+    if (!ti) continue;
+    if (inYear && ti.role === 'contributi') contribPagatiN += +t.amount;
+    if (ti.year === N && ti.role === 'imposta' && ti.part === 'acconto') accontiN += +t.amount;
+    if (ti.year === N && (ti.role === 'contributi' || ti.role === 'integrativo')) contribPerN += +t.amount;
+  }
+  const cassa = CASSE[P.cassa] ? { ...CASSE[P.cassa], ...(P.cassaVals || {}) } : CASSE.nessuna;
+  const integPct = num(cassa.integ);
+  const compensiReali = P.integ_incluso && integPct ? incassi / (1 + integPct / 100) : incassi;
+  let factor = 1;
+  if (N === cur && P.proietta) { const start = new Date(cur, 0, 1), days = Math.floor((new Date() - start) / 864e5) + 1, tot = (cur % 4 === 0 ? 366 : 365); factor = tot / Math.max(days, 1); }
+  const compensi = compensiReali * factor, spesePro = spese * factor;
+  const r = { N, factor, incassi: incassi * factor, compensi, spesePro, contribPagatiN, accontiN, contribPerN, cassa };
+  if (P.regime === 'forfettario') {
+    r.redditoLordo = compensi * num(P.coeff ?? 78) / 100;
+    r.imponibile = Math.max(0, r.redditoLordo - contribPagatiN);
+    r.imposta = r.imponibile * num(P.aliquota ?? 15) / 100;
+    r.accontoBase = r.imposta;
+  } else if (P.regime === 'ordinario') {
+    r.redditoLordo = Math.max(0, compensi - spesePro);
+    r.imponibile = Math.max(0, r.redditoLordo - contribPagatiN);
+    r.irpefLorda = irpef(r.imponibile);
+    r.irpefNetta = Math.max(0, r.irpefLorda - num(P.detrazioni));
+    r.addizionali = r.imponibile * num(P.addizionali) / 100;
+    r.imposta = r.irpefNetta + r.addizionali;
+    r.accontoBase = r.irpefNetta;
+  } else return null;
+  r.saldo = r.imposta - accontiN;
+  const base = r.accontoBase;
+  r.accontiNext = base <= 51.65 ? 0 : base;
+  const first = num(P.prima_rata ?? 40) / 100;
+  r.acc1 = r.accontiNext >= 257.52 ? r.accontiNext * first : 0;
+  r.acc2 = r.accontiNext - r.acc1;
+  const baseCassa = Math.max(0, r.redditoLordo);
+  let bSogg = baseCassa; if (num(cassa.massimale) > 0) bSogg = Math.min(bSogg, num(cassa.massimale));
+  r.sogg = num(cassa.sogg) ? Math.max(num(cassa.soggMin), bSogg * num(cassa.sogg) / 100) : 0;
+  r.integ = integPct ? Math.max(num(cassa.integMin), compensiReali * factor * integPct / 100) : 0;
+  r.fissi = num(cassa.fissi);
+  r.contribDovuti = r.sogg + r.integ + r.fissi;
+  r.conguaglio = r.contribDovuti - contribPerN;
+  r.giugno = Math.max(0, r.saldo) + r.acc1;
+  r.novembre = r.acc2;
+  r.totale = r.giugno + r.novembre + Math.max(0, r.conguaglio);
+  const juneEnd = new Date(N + 1, 5, 30), months = Math.max(1, Math.round((juneEnd - new Date()) / (30.44 * 864e5)));
+  r.mesi = months; r.alMese = (r.giugno + Math.max(0, r.conguaglio)) / months;
+  return r;
+}
+
+function Row({ l, v, b, cls, hint }) {
+  return html`<div style="display:flex;justify-content:space-between;gap:12px;padding:7px 0;border-bottom:1px solid var(--line)"><span>${l}${hint ? html`<span class="mut" style="font-size:.8rem"> ${hint}</span>` : null}</span><span class=${'num ' + (cls || '')} style=${b ? 'font-weight:800' : ''}>${v}</span></div>`;
+}
+
+function TaxView({ store, openProfile }) {
+  const d = store.data, P = d.settings.tax || {}, cur = Number(todayIso().slice(0, 4));
+  const [N, setN] = useState(cur);
+  const r = useMemo(() => (P.regime === 'forfettario' || P.regime === 'ordinario') ? computeTax(d, P, N) : null, [store.st.version, N]);
+  if (!P.regime) return html`<div class="empty" style="margin-top:10px">Imposta il tuo profilo fiscale per vedere quanto mettere da parte per tasse e contributi.<button class="btn" onClick=${openProfile}>Imposta profilo fiscale</button></div>`;
+  if (P.regime === 'dipendente') return html`<div><div class="card" style="margin-top:10px"><b>Lavoro dipendente</b><p class="hint">Sul lavoro dipendente le imposte le trattiene il datore di lavoro in busta paga, quindi qui non ci sono versamenti da accantonare. Se hai anche una partita IVA, scegli forfettario o ordinario nel profilo.</p></div><button class="btn sec2" onClick=${openProfile}>Modifica profilo fiscale</button></div>`;
+  if (!r) return null;
+  const nx = N + 1;
+  return html`<div>
+    <div class="month"><button class="iconbtn" aria-label="Anno precedente" onClick=${() => setN(N - 1)}>‹</button><h2>Redditi ${N}</h2><button class="iconbtn" aria-label="Anno successivo" onClick=${() => setN(N + 1)} disabled=${N >= cur}>›</button></div>
+    <div class="card" style="background:var(--btn);color:var(--btnText)"><div style="font-size:.85rem;opacity:.8">Da mettere da parte per i redditi ${N}</div><div class="num" style="font-size:2.2rem;font-weight:800">${eur(r.totale)}</div>
+      <div style="font-size:.9rem;opacity:.9">Circa ${eur(r.alMese)} al mese per arrivare pronto a giugno ${nx}</div></div>
+    ${r.factor > 1.001 && html`<p class="hint">Proiezione a fine anno: incassi e spese di finora moltiplicati per ${String(round2(r.factor)).replace('.', ',')}. Puoi disattivarla nel profilo.</p>`}
+    <div class="sec">Scadenze previste</div>
+    <div class="card">
+      <${Row} l=${'30 giugno ' + nx} hint="saldo + 1° acconto" v=${eur(r.giugno)} b />
+      <${Row} l=${'30 novembre ' + nx} hint="2° acconto" v=${eur(r.novembre)} b />
+      ${r.cassa.label !== CASSE.nessuna.label && html`<${Row} l="Conguaglio contributi" hint="calendario della tua cassa" v=${eur(Math.max(0, r.conguaglio))} b />`}
+      <p class="hint">Date ordinarie: ogni anno possono esserci proroghe. Il saldo e gli acconti vanno confermati col commercialista.</p></div>
+    <div class="sec">Imposta ${N}</div>
+    <div class="card">
+      <${Row} l="Incassi considerati" v=${eur(r.incassi)} />
+      ${P.integ_incluso && r.cassa.integ ? html`<${Row} l="Compensi senza integrativo" v=${eur(r.compensi)} />` : null}
+      ${P.regime === 'forfettario' ? html`<${Row} l=${'Reddito forfettario (' + pct(num(P.coeff ?? 78)) + ')'} v=${eur(r.redditoLordo)} />` : html`<${Row} l="Spese di lavoro" v=${'−' + eur(r.spesePro)} /><${Row} l="Reddito" v=${eur(r.redditoLordo)} />`}
+      <${Row} l=${'Contributi versati nel ' + N} v=${'−' + eur(r.contribPagatiN)} />
+      <${Row} l="Imponibile" v=${eur(r.imponibile)} />
+      ${P.regime === 'forfettario' ? html`<${Row} l=${'Imposta sostitutiva ' + pct(num(P.aliquota ?? 15))} v=${eur(r.imposta)} b />`
+        : html`<${Row} l="IRPEF lorda" v=${eur(r.irpefLorda)} /><${Row} l="Detrazioni" v=${'−' + eur(Math.min(r.irpefLorda, num(P.detrazioni)))} /><${Row} l="Addizionali" v=${eur(r.addizionali)} /><${Row} l="Imposta totale" v=${eur(r.imposta)} b />`}
+      <${Row} l=${'Acconti già versati per il ' + N} v=${'−' + eur(r.accontiN)} />
+      <${Row} l=${'Saldo previsto a giugno ' + nx} v=${eur(r.saldo)} b cls=${r.saldo < 0 ? 'in' : ''} />
+      ${r.saldo < 0 && html`<p class="hint">Negativo: gli acconti versati superano l’imposta stimata, quindi risulterebbe un credito.</p>`}
+      <${Row} l=${'Acconti ' + nx + ' (metodo storico)'} v=${eur(r.accontiNext)} />
+    </div>
+    ${r.cassa.label !== CASSE.nessuna.label && html`<div class="sec">Contributi ${N}: ${r.cassa.label}</div>
+    <div class="card">
+      ${r.sogg ? html`<${Row} l=${'Soggettivo ' + pct(num(r.cassa.sogg))} v=${eur(r.sogg)} />` : null}
+      ${r.integ ? html`<${Row} l=${'Integrativo ' + pct(num(r.cassa.integ))} v=${eur(r.integ)} />` : null}
+      ${r.fissi ? html`<${Row} l="Quote fisse" v=${eur(r.fissi)} />` : null}
+      <${Row} l="Totale dovuto" v=${eur(r.contribDovuti)} b />
+      <${Row} l=${'Già versati per il ' + N} v=${'−' + eur(r.contribPerN)} />
+      <${Row} l="Conguaglio previsto" v=${eur(r.conguaglio)} b cls=${r.conguaglio < 0 ? 'in' : ''} />
+    </div>`}
+    <p class="hint">È una stima basata sui movimenti registrati e sui parametri del profilo. Non sostituisce il calcolo del commercialista.</p>
+    <button class="btn sec2" onClick=${openProfile}>Modifica profilo fiscale</button>
+  </div>`;
+}
+
+function TaxProfile({ store, onClose }) {
+  const d = store.data, P0 = d.settings.tax || {};
+  const [regime, setRegime] = useState(P0.regime || 'forfettario');
+  const [aliquota, setAliquota] = useState(fmtIn(P0.aliquota ?? 15));
+  const [coeff, setCoeff] = useState(fmtIn(P0.coeff ?? 78));
+  const [detrazioni, setDetrazioni] = useState(fmtIn(P0.detrazioni ?? ''));
+  const [addizionali, setAddizionali] = useState(fmtIn(P0.addizionali ?? ''));
+  const [cassa, setCassa] = useState(P0.cassa || 'nessuna');
+  const initVals = c => { const b = CASSE[c]; const v = (P0.cassa === c && P0.cassaVals) || {}; return { sogg: fmtIn(v.sogg ?? b.sogg), soggMin: fmtIn(v.soggMin ?? b.soggMin), integ: fmtIn(v.integ ?? b.integ), integMin: fmtIn(v.integMin ?? b.integMin), fissi: fmtIn(v.fissi ?? b.fissi), massimale: fmtIn(v.massimale ?? b.massimale) }; };
+  const [cv, setCv] = useState(initVals(P0.cassa || 'nessuna'));
+  const [integIncl, setIntegIncl] = useState(!!P0.integ_incluso);
+  const [onlyInv, setOnlyInv] = useState(P0.only_invoiced !== false);
+  const [proietta, setProietta] = useState(!!P0.proietta);
+  const [primaRata, setPrimaRata] = useState(fmtIn(P0.prima_rata ?? 40));
+  const [roles, setRoles] = useState({ ...(P0.roles || {}) });
+  const taxCats = live(d.categories).filter(c => c.scope === 'tax').sort(bySort);
+  const pickCassa = c => { setCassa(c); setCv(initVals(c)); };
+  const setV = (k, v) => setCv({ ...cv, [k]: v });
+  const save = () => {
+    const vals = {}; for (const k of Object.keys(cv)) vals[k] = num(cv[k]);
+    const rl = {}; for (const c of taxCats) rl[c.id] = roles[c.id] || roleOfCat(c, {});
+    store.setSettings({ tax: { regime, aliquota: num(aliquota), coeff: num(coeff), detrazioni: num(detrazioni), addizionali: num(addizionali), cassa, cassaVals: vals, integ_incluso: integIncl, only_invoiced: onlyInv, proietta, prima_rata: num(primaRata), roles: rl } });
+    onClose();
+  };
+  const piva = regime === 'forfettario' || regime === 'ordinario';
+  return html`<${Sheet} title="Profilo fiscale" onClose=${onClose}>
+    <p class="hint">I valori proposti vengono da fonti ufficiali indicate sotto ogni campo. Controllali col tuo commercialista: cambiano da un anno all’altro.</p>
+    <label class="f"><span>Inquadramento</span><div class="seg">${[['forfettario', 'Forfettario'], ['ordinario', 'Ordinario'], ['dipendente', 'Dipendente']].map(([k, l]) => html`<button type="button" class=${regime === k ? 'on' : ''} onClick=${() => setRegime(k)}>${l}</button>`)}</div></label>
+    ${regime === 'forfettario' && html`
+      <label class="f"><span>Aliquota imposta sostitutiva (%)</span><div class="chips" style="margin-bottom:8px">${['15', '5'].map(v => html`<button type="button" class=${'chip' + (aliquota === v ? ' on' : '')} onClick=${() => setAliquota(v)}>${v}%</button>`)}</div><input class="i num" inputmode="decimal" value=${aliquota} onInput=${e => setAliquota(e.target.value)} /></label>
+      <p class="hint">15% ordinaria (Agenzia delle Entrate). 5% solo per le nuove attività che hanno i requisiti, per i primi anni.</p>
+      <label class="f"><span>Coefficiente di redditività (%)</span><select class="i" value=${COEFF.some(([v]) => String(v) === coeff) ? coeff : ''} onChange=${e => e.target.value && setCoeff(e.target.value)}><option value="">Scegli il gruppo della tua attività</option>${COEFF.map(([v, l]) => html`<option value=${String(v)}>${v}%: ${l}</option>`)}</select>
+        <input class="i num" style="margin-top:8px" inputmode="decimal" value=${coeff} onInput=${e => setCoeff(e.target.value)} /></label>
+      <p class="hint">Tabella dell’Allegato 2 alla legge 145/2018, in base al codice ATECO.</p>`}
+    ${regime === 'ordinario' && html`
+      <p class="hint" style="margin-top:12px">IRPEF 2026 per scaglioni: 23% fino a 28.000 €, 33% fino a 50.000 €, 43% oltre (legge 199/2025). Le spese di lavoro sono le uscite con voci di tipo “Lavoro”.</p>
+      <${AmountField} label="Detrazioni annue stimate (€)" value=${detrazioni} onInput=${setDetrazioni} />
+      <p class="hint">Le detrazioni dipendono dalla tua situazione: prendi il valore dall’ultima dichiarazione o chiedilo al commercialista.</p>
+      <${AmountField} label="Addizionali regionale + comunale (%)" value=${addizionali} onInput=${setAddizionali} />
+      <p class="hint">Dipendono da regione e comune di residenza: non propongo un valore perché non l’ho verificato.</p>`}
+    ${piva && html`
+      <label class="f"><span>Cassa previdenziale</span><select class="i" value=${cassa} onChange=${e => pickCassa(e.target.value)}>${Object.entries(CASSE).map(([k, c]) => html`<option value=${k}>${c.label}</option>`)}</select></label>
+      ${CASSE[cassa].fonte && html`<p class="hint">${CASSE[cassa].fonte}</p>`}
+      ${cassa !== 'nessuna' && html`
+        <div class="two"><${AmountField} label="Soggettivo (%)" value=${cv.sogg} onInput=${v => setV('sogg', v)} /><${AmountField} label="Soggettivo minimo (€)" value=${cv.soggMin} onInput=${v => setV('soggMin', v)} /></div>
+        <div class="two"><${AmountField} label="Integrativo (%)" value=${cv.integ} onInput=${v => setV('integ', v)} /><${AmountField} label="Integrativo minimo (€)" value=${cv.integMin} onInput=${v => setV('integMin', v)} /></div>
+        <div class="two"><${AmountField} label="Quote fisse annue (€)" value=${cv.fissi} onInput=${v => setV('fissi', v)} /><${AmountField} label="Massimale reddito (€, 0 = nessuno)" value=${cv.massimale} onInput=${v => setV('massimale', v)} /></div>
+        ${num(cv.integ) > 0 && html`<label class="check"><input type="checkbox" checked=${integIncl} onChange=${e => setIntegIncl(e.target.checked)} />Le entrate che registro includono già l’integrativo addebitato al cliente</label>`}`}
+      <label class="check"><input type="checkbox" checked=${onlyInv} onChange=${e => setOnlyInv(e.target.checked)} />Considera solo le entrate di lavoro con fattura</label>
+      <label class="check"><input type="checkbox" checked=${proietta} onChange=${e => setProietta(e.target.checked)} />Per l’anno in corso, proietta gli incassi a fine anno</label>
+      <${AmountField} label="Prima rata acconto (%)" value=${primaRata} onInput=${setPrimaRata} />
+      <p class="hint">Ripartizione ordinaria 40% a giugno e 60% a novembre. Per i soggetti ISA è 50% e 50%, e sui forfettari le fonti non concordano: chiedi al commercialista quale vale per te.</p>
+      ${taxCats.length > 0 && html`<div class="sec">Che cosa sono i tuoi versamenti</div><p class="hint">Serve a distinguere l’imposta dai contributi nelle voci di tipo “Tasse e contributi”.</p>
+        ${taxCats.map(c => html`<label class="f"><span>${c.name}</span><select class="i" value=${roles[c.id] || roleOfCat(c, {})} onChange=${e => setRoles({ ...roles, [c.id]: e.target.value })}>${Object.entries(TAX_ROLES).map(([k, l]) => html`<option value=${k}>${l}</option>`)}</select></label>`)}`}`}
+    <button class="btn" onClick=${save}>Salva profilo</button>
+  <//>`;
+}
+
 // ---------- impostazioni ----------
 function Settings({ store, user, open }) {
   const s = store.data.settings;
@@ -849,7 +1068,7 @@ function Settings({ store, user, open }) {
   const nAcc = live(store.data.accounts).length, nCat = live(store.data.categories).length;
   return html`<div>
     <div class="sec">Personalizza</div>
-    <div><button class="setrow" onClick=${() => open('accounts')}><span>Conti</span><small>${nAcc} ›</small></button><button class="setrow" onClick=${() => open('categories')}><span>Voci di entrata e uscita</span><small>${nCat} ›</small></button></div>
+    <div><button class="setrow" onClick=${() => open('accounts')}><span>Conti</span><small>${nAcc} ›</small></button><button class="setrow" onClick=${() => open('categories')}><span>Voci di entrata e uscita</span><small>${nCat} ›</small></button><button class="setrow" onClick=${() => open('taxprofile')}><span>Profilo fiscale</span><small>›</small></button></div>
     <div class="sec">Pagamenti con POS</div>
     <div class="card"><p class="hint" style="margin-top:0">Le condizioni del tuo contratto POS. Vengono proposte in automatico quando segni un incasso con POS.</p>
       <div class="two"><${AmountField} label="Commissione %" value=${pct} onInput=${setPct} /><${AmountField} label="Costo fisso (€)" value=${fix} onInput=${setFix} /></div>
@@ -885,19 +1104,21 @@ function Main({ user }) {
   if (!hasAcc && !st.loaded) return html`<div class="center"><p class="brand">Finanze</p><p class="mut">${st.error || 'Caricamento dei tuoi dati…'}</p>${st.error && html`<button class="btn" onClick=${() => store.pull()}>Riprova</button>`}</div>`;
   if (!hasAcc) return html`<${Welcome} store=${store} />`;
   const close = () => setSheet(null);
-  const TABS = [['mov', '☰', 'Movimenti'], ['charts', '▤', 'Grafici'], ['rec', '↻', 'Ricorrenti'], ['set', '⚙', 'Impostazioni']];
+  const TABS = [['mov', '☰', 'Movimenti'], ['charts', '▤', 'Grafici'], ['tax', '%', 'Tasse'], ['rec', '↻', 'Ricorrenti'], ['set', '⚙', 'Impostazioni']];
   return html`<div class="wrap">
     <div class="top"><h1>${TABS.find(t => t[0] === tab)[2]}</h1><${SyncPill} store=${store} /></div>
     ${tab === 'mov' && html`<${Movements} store=${store} openTx=${t => setSheet({ k: 'tx', v: t })} goTab=${setTab} />`}
     ${tab === 'charts' && html`<${Charts} store=${store} />`}
     ${tab === 'rec' && html`<${Recurring} store=${store} openRec=${r => setSheet({ k: 'rec', v: r })} />`}
+    ${tab === 'tax' && html`<${TaxView} store=${store} openProfile=${() => setSheet({ k: 'taxprofile' })} />`}
     ${tab === 'set' && html`<${Settings} store=${store} user=${user} open=${k => setSheet({ k })} />`}
-    ${(tab === 'mov' || tab === 'charts') && html`<button class="fab" onClick=${() => setSheet({ k: 'tx', v: {} })}>+ Movimento</button>`}
+    ${(tab === 'mov' || tab === 'charts' || tab === 'tax') && html`<button class="fab" onClick=${() => setSheet({ k: 'tx', v: {} })}>+ Movimento</button>`}
     <nav class="tabs"><div class="in2">${TABS.map(([k, ic, l]) => html`<button class=${tab === k ? 'on' : ''} aria-current=${tab === k ? 'page' : null} onClick=${() => setTab(k)}><span aria-hidden="true">${ic}</span>${l}</button>`)}</div></nav>
     ${sheet?.k === 'tx' && html`<${TxForm} key=${sheet.v.id || 'new'} store=${store} tx=${sheet.v} onClose=${close} />`}
     ${sheet?.k === 'rec' && html`<${RecForm} key=${sheet.v.id || 'new'} store=${store} rec=${sheet.v} onClose=${close} />`}
     ${sheet?.k === 'accounts' && html`<${AccountsEditor} store=${store} onClose=${close} />`}
     ${sheet?.k === 'categories' && html`<${CategoriesEditor} store=${store} onClose=${close} />`}
+    ${sheet?.k === 'taxprofile' && html`<${TaxProfile} store=${store} onClose=${close} />`}
     ${sheet?.k === 'trash' && html`<${Trash} store=${store} onClose=${close} />`}
     ${sheet?.k === 'snapshots' && html`<${Snapshots} store=${store} onClose=${close} />`}
   </div>`;
