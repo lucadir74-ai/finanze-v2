@@ -718,7 +718,7 @@ function RecForm({ store, rec, onClose }) {
     ${!isNew && html`<button class="btn danger" onClick=${del}>Elimina ricorrenza</button>`}
   <//>`;
 }
-function Recurring({ store, openRec }) {
+function Recurring({ store, openRec, openPlan }) {
   const d = store.data, today = todayIso();
   const reminders = useMemo(() => pendingReminders(d), [store.st.version]);
   const tw = useMemo(() => taxWindows(d), [store.st.version]);
@@ -727,12 +727,12 @@ function Recurring({ store, openRec }) {
   const skip = p => { if (confirm('Segnare come da non registrare? Non verrà più proposto.')) store.upsert('transactions', { ...txFromRec(p.r, p.date, p.id), deleted: true }); };
   return html`<div>
     ${(reminders.length > 0 || tw.due.length > 0) && html`<div class="sec">Da registrare</div>`}
-    ${tw.due.length > 0 && html`<div class="list" style="margin-bottom:8px">${tw.due.map(dl => html`<${DeadlineRow} key=${dl.id} store=${store} dl=${dl} past=${dl.date <= today} />`)}</div>`}
+    ${tw.due.length > 0 && html`<div class="list" style="margin-bottom:8px">${tw.due.map(dl => html`<${DeadlineRow} key=${dl.id} store=${store} dl=${dl} past=${dl.date <= today} openPlan=${openPlan} />`)}</div>`}
     ${reminders.length > 0 && html`<div class="list">${reminders.map(p => html`<div class="row" style="cursor:default">
       <i class="dot" style=${'--c:' + (d.categories[p.r.category_id]?.color || '#999')}></i>
       <div class="mid"><div class="t">${p.r.note || d.categories[p.r.category_id]?.name || 'Ricorrenza'}</div><div class="s">scadenza ${shortDate(p.date)}, ${eur(p.r.amount)}</div></div>
       <button class="chip" onClick=${() => register(p)}>Registra</button><button class="linkbtn" onClick=${() => skip(p)} aria-label="Ignora">Ignora</button></div>`)}</div>`}
-    ${tw.upcoming.length > 0 && html`<div class="sec">Prossime scadenze fiscali</div><div class="list">${tw.upcoming.map(dl => html`<${DeadlineRow} key=${dl.id} store=${store} dl=${dl} />`)}</div>
+    ${tw.upcoming.length > 0 && html`<div class="sec">Prossime scadenze fiscali</div><div class="list">${tw.upcoming.map(dl => html`<${DeadlineRow} key=${dl.id} store=${store} dl=${dl} openPlan=${openPlan} />`)}</div>
       <p class="hint">Calcolate dal profilo fiscale e dalla stima della scheda Tasse. Quando paghi, premi Registra e correggi l’importo con quello dell’F24 o dell’avviso: acconto, saldo e anno si impostano da soli.</p>`}
     <div class="sec">Ricorrenze</div>
     ${recs.length === 0 ? html`<div class="empty">Aggiungi qui affitto, abbonamenti, stipendio o scadenze annuali come l’assicurazione.</div>`
@@ -924,7 +924,7 @@ function computeTax(d, P, N) {
   let factor = 1;
   if (N === cur && P.proietta) { const start = new Date(cur, 0, 1), days = Math.floor((new Date() - start) / 864e5) + 1, tot = (cur % 4 === 0 ? 366 : 365); factor = tot / Math.max(days, 1); }
   const compensi = compensiReali * factor, spesePro = spese * factor;
-  const r = { N, factor, hasData, opening: op, incassi: incassi * factor, compensi, spesePro, contribPagatiN, accontiN, contribPerN, cassa };
+  const r = { N, factor, hasData, hasIncome: incassi > 0, opening: op, incassi: incassi * factor, compensi, spesePro, contribPagatiN, accontiN, contribPerN, cassa };
   if (P.regime === 'forfettario') {
     r.redditoLordo = compensi * num(P.coeff ?? 78) / 100;
     r.imponibile = Math.max(0, r.redditoLordo - contribPagatiN);
@@ -967,7 +967,7 @@ function taxDeadlines(d) {
   const today = todayIso(), cur = Number(today.slice(0, 4)), out = [];
   const infos = live(d.transactions).filter(t => t.kind === 'expense').map(t => ({ t, ti: taxInfo(t, d, P) })).filter(x => x.ti);
   const cache = {}; const ct = y => (y in cache ? cache[y] : (cache[y] = piva ? computeTax(d, P, y) : null));
-  const known = r => r && r.hasData;
+  const known = r => r && r.hasIncome;
   const first = num(P.prima_rata ?? 40) / 100;
   const isContr = x => x.ti.role === 'contributi' || x.ti.role === 'integrativo';
   for (const Y of [cur, cur + 1]) {
@@ -978,8 +978,8 @@ function taxDeadlines(d) {
       const saldoAmt = known(base) ? Math.max(0, round2(base.saldo)) : null;
       let acc1 = known(base) ? round2(base.acc1) : null, acc2 = known(base) ? round2(base.acc2) : null;
       if (acc2 === null && paid1 > 0 && first > 0 && first < 1) acc2 = round2(paid1 * (1 - first) / first);
-      if (saldoAmt !== 0) out.push({ id: `tax:imp-saldo:${Y - 1}`, date: `${Y}-06-30`, label: `Saldo imposta ${Y - 1}`, amount: saldoAmt, role: 'imposta', part: 'saldo', year: Y - 1, done: infos.some(x => x.ti.role === 'imposta' && x.ti.part === 'saldo' && x.ti.year === Y - 1) });
-      if (acc1 !== 0) out.push({ id: `tax:imp-acc1:${Y}`, date: `${Y}-06-30`, label: `1° acconto imposta ${Y}`, amount: acc1, role: 'imposta', part: 'acconto', year: Y, done: paid1 > 0 });
+      if (saldoAmt !== 0) out.push({ id: `tax:imp-saldo:${Y - 1}`, rate: 'tax', date: `${Y}-06-30`, label: `Saldo imposta ${Y - 1}`, amount: saldoAmt, role: 'imposta', part: 'saldo', year: Y - 1, done: infos.some(x => x.ti.role === 'imposta' && x.ti.part === 'saldo' && x.ti.year === Y - 1) });
+      if (acc1 !== 0) out.push({ id: `tax:imp-acc1:${Y}`, rate: 'tax', date: `${Y}-06-30`, label: `1° acconto imposta ${Y}`, amount: acc1, role: 'imposta', part: 'acconto', year: Y, done: paid1 > 0 });
       if (acc2 !== 0) out.push({ id: `tax:imp-acc2:${Y}`, date: `${Y}-11-30`, label: `2° acconto imposta ${Y}`, amount: acc2, role: 'imposta', part: 'acconto', year: Y, done: acc.some(x => x.t.date > `${Y}-10-31`) });
     }
     if (P.cassa === 'enpab') {
@@ -990,10 +990,54 @@ function taxDeadlines(d) {
         out.push({ id: `tax:enpab-min2:${Y}`, date: `${Y}-06-30`, label: `Minimi ENPAB ${Y}, 2ª rata`, amount: round2(min / 2), role: 'contributi', part: 'acconto', year: Y, done: nAcc >= 2 });
       }
       const cong = known(base) ? Math.max(0, round2(base.conguaglio)) : null;
-      if (cong !== 0) out.push({ id: `tax:enpab-cong:${Y - 1}`, date: `${Y}-10-31`, label: `Conguaglio ENPAB ${Y - 1}`, hint: 'anche in 4 rate fino a febbraio', amount: cong, role: 'contributi', part: 'saldo', year: Y - 1, done: infos.some(x => isContr(x) && x.ti.part === 'saldo' && x.ti.year === Y - 1) });
+      if (cong !== 0) out.push({ id: `tax:enpab-cong:${Y - 1}`, rate: 'enpab', date: `${Y}-10-31`, label: `Conguaglio ENPAB ${Y - 1}`, hint: 'anche in 4 rate fino a febbraio', amount: cong, role: 'contributi', part: 'saldo', year: Y - 1, done: infos.some(x => isContr(x) && x.ti.part === 'saldo' && x.ti.year === Y - 1) });
     }
   }
-  return out.filter(x => !x.done && !d.transactions[x.id]).sort((a, b) => a.date.localeCompare(b.date));
+  const plans = P.plans || {}, res = [];
+  for (const x of out) {
+    const pl = plans[x.id];
+    if (pl && Array.isArray(pl.dates)) {
+      pl.dates.forEach((dt, k) => { const id = `${x.id}:r${k + 1}`; if (!d.transactions[id]) res.push({ ...x, id, parent: x.id, date: dt, amount: pl.amounts[k], label: `${x.label}, rata ${k + 1} di ${pl.dates.length}`, hint: k > 0 && x.rate === 'tax' ? 'interessi stimati inclusi' : '', rate: null }); });
+    } else if (!x.done && !d.transactions[x.id]) res.push(x);
+  }
+  return res.sort((a, b) => a.date.localeCompare(b.date));
+}
+// Piani di rateizzazione. Fonti: calendario ENPAB 2026-2027 (conguaglio in unica soluzione o 4 rate:
+// 31/10, 30/11, 31/12, 1/2); imposte: art. 8 D.Lgs. 1/2024 e circ. AE 9/2024 (saldo e 1° acconto in rate
+// mensili il 16 di ogni mese, ultima entro il 16 dicembre, interessi 4% annuo; il 2° acconto non è rateizzabile).
+function ratePlanDates(dl) {
+  const Y = Number(dl.date.slice(0, 4));
+  if (dl.rate === 'enpab') return [`${Y}-10-31`, `${Y}-11-30`, `${Y}-12-31`, `${Y + 1}-02-01`];
+  const out = [dl.date]; for (let m = Number(dl.date.slice(5, 7)) + 1; m <= 12; m++) out.push(`${Y}-${pad(m)}-16`);
+  return out;
+}
+function buildPlan(dl, total, n) {
+  const all = ratePlanDates(dl), dates = dl.rate === 'enpab' ? all : all.slice(0, n);
+  const base = round2(total / dates.length), amounts = [];
+  const d0 = new Date(dates[0]);
+  dates.forEach((dt, k) => {
+    let q = k === dates.length - 1 ? round2(total - base * (dates.length - 1)) : base;
+    if (dl.rate === 'tax' && k > 0) q = round2(q * (1 + 0.04 * ((new Date(dt) - d0) / 864e5) / 365));
+    amounts.push(q);
+  });
+  return { dates, amounts };
+}
+function RatePlan({ store, dl, onClose }) {
+  const P = store.data.settings.tax || {};
+  const max = ratePlanDates(dl).length;
+  const [total, setTotal] = useState(dl.amount != null ? fmtIn(dl.amount) : ''), [n, setN] = useState(String(Math.min(max, dl.rate === 'enpab' ? 4 : 4)));
+  const t = parseAmt(total), nn = Math.max(2, Math.min(max, Number(n) || 2));
+  const plan = t > 0 ? buildPlan(dl, t, nn) : null;
+  const save = () => { if (!plan) return alert('Scrivi l’importo totale da rateizzare.'); store.setSettings({ tax: { ...P, plans: { ...(P.plans || {}), [dl.id]: plan } } }); onClose(); };
+  return html`<${Sheet} title=${'Rateizza: ' + dl.label} onClose=${onClose}>
+    <${AmountField} label="Importo totale da rateizzare (€)" value=${total} onInput=${setTotal} />
+    ${dl.rate === 'enpab' ? html`<p class="hint">ENPAB: il conguaglio si paga in unica soluzione oppure in 4 rate (31 ottobre, 30 novembre, 31 dicembre, 1° febbraio), secondo il calendario ufficiale. Usa gli importi dell’avviso ENPAB se sono diversi.</p>`
+      : html`<label class="f"><span>Numero di rate (massimo ${max})</span><input class="i num" inputmode="numeric" value=${n} onInput=${e => setN(e.target.value)} /></label>
+        <p class="hint">Rate mensili il 16 di ogni mese, l’ultima entro il 16 dicembre, con interessi del 4% annuo dalla seconda rata (D.Lgs. 1/2024). Gli interessi sono stimati: gli importi esatti li trovi negli F24 del commercialista.</p>`}
+    ${plan && html`<div class="card" style="margin-top:12px">${plan.dates.map((dt, k) => html`<${Row} l=${'Rata ' + (k + 1) + ' • ' + shortDate(dt)} v=${eur(plan.amounts[k])} />`)}
+      <${Row} l="Totale" v=${eur(plan.amounts.reduce((a, b) => a + b, 0))} b /></div>`}
+    <button class="btn" onClick=${save}>Salva rateizzazione</button>
+  <//>`;
 }
 function taxWindows(d) {
   const all = taxDeadlines(d), today = todayIso();
@@ -1021,11 +1065,20 @@ function skipDeadline(store, dl) {
   if (!confirm(`Non registrare "${dl.label}"? Non verrà più proposto (per esempio se l’hai già registrato in altro modo o non era dovuto).`)) return;
   store.upsert('transactions', { id: dl.id, date: dl.date, kind: 'expense', amount: 0, note: dl.label, tax_part: dl.part, tax_year: dl.year, deleted: true });
 }
-function DeadlineRow({ store, dl, past }) {
-  return html`<div class="row" style="cursor:default">
+function removePlan(store, dl) {
+  const P = store.data.settings.tax || {}, pl = P.plans?.[dl.parent];
+  if (pl && pl.dates.some((_, k) => store.data.transactions[`${dl.parent}:r${k + 1}`])) return alert('Hai già registrato almeno una rata: per cambiare piano elimina prima quelle rate dai movimenti.');
+  if (!confirm('Annullare la rateizzazione e tornare al pagamento in un’unica soluzione?')) return;
+  const plans = { ...(P.plans || {}) }; delete plans[dl.parent]; store.setSettings({ tax: { ...P, plans } });
+}
+function DeadlineRow({ store, dl, past, openPlan }) {
+  return html`<div class="row" style="cursor:default;flex-wrap:wrap">
     <i class="dot" style="--c:var(--tax)"></i>
     <div class="mid"><div class="t">${dl.label}</div><div class="s">${past ? 'scadenza' : 'entro il'} ${shortDate(dl.date)}, ${dl.amount != null ? 'stima ' + eur(dl.amount) : 'importo dall’avviso'}${dl.hint ? ', ' + dl.hint : ''}</div></div>
-    <button class="chip" onClick=${() => registerDeadline(store, dl)}>Registra</button><button class="linkbtn" onClick=${() => skipDeadline(store, dl)}>Ignora</button></div>`;
+    <button class="chip" onClick=${() => registerDeadline(store, dl)}>Registra</button>
+    ${dl.rate && openPlan ? html`<button class="linkbtn" onClick=${() => openPlan(dl)}>Rate</button>` : null}
+    ${dl.parent && dl.id.endsWith(':r1') ? html`<button class="linkbtn" onClick=${() => removePlan(store, dl)}>Annulla rate</button>` : null}
+    ${!dl.parent ? html`<button class="linkbtn" onClick=${() => skipDeadline(store, dl)}>Ignora</button>` : null}</div>`;
 }
 
 function Row({ l, v, b, cls, hint }) {
@@ -1229,7 +1282,7 @@ function Main({ user }) {
     <div class="top"><h1>${TABS.find(t => t[0] === tab)[2]}</h1><${SyncPill} store=${store} /></div>
     ${tab === 'mov' && html`<${Movements} store=${store} openTx=${t => setSheet({ k: 'tx', v: t })} goTab=${setTab} />`}
     ${tab === 'charts' && html`<${Charts} store=${store} />`}
-    ${tab === 'rec' && html`<${Recurring} store=${store} openRec=${r => setSheet({ k: 'rec', v: r })} />`}
+    ${tab === 'rec' && html`<${Recurring} store=${store} openRec=${r => setSheet({ k: 'rec', v: r })} openPlan=${dl => setSheet({ k: 'plan', v: dl })} />`}
     ${tab === 'tax' && html`<${TaxView} store=${store} openProfile=${() => setSheet({ k: 'taxprofile' })} openTx=${t => setSheet({ k: 'tx', v: t })} openOpening=${y => setSheet({ k: 'opening', v: y })} />`}
     ${tab === 'set' && html`<${Settings} store=${store} user=${user} open=${k => setSheet({ k })} />`}
     ${(tab === 'mov' || tab === 'charts' || tab === 'tax') && html`<button class="fab" onClick=${() => setSheet({ k: 'tx', v: {} })}>+ Movimento</button>`}
@@ -1238,6 +1291,7 @@ function Main({ user }) {
     ${sheet?.k === 'rec' && html`<${RecForm} key=${sheet.v.id || 'new'} store=${store} rec=${sheet.v} onClose=${close} />`}
     ${sheet?.k === 'accounts' && html`<${AccountsEditor} store=${store} onClose=${close} />`}
     ${sheet?.k === 'categories' && html`<${CategoriesEditor} store=${store} onClose=${close} />`}
+    ${sheet?.k === 'plan' && html`<${RatePlan} store=${store} dl=${sheet.v} onClose=${close} />`}
     ${sheet?.k === 'opening' && html`<${TaxOpening} store=${store} year=${sheet.v} onClose=${close} />`}
     ${sheet?.k === 'taxprofile' && html`<${TaxProfile} store=${store} onClose=${close} />`}
     ${sheet?.k === 'trash' && html`<${Trash} store=${store} onClose=${close} />`}
