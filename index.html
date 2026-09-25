@@ -863,7 +863,7 @@ const COEFF = [[40, 'Alimentari, commercio, alloggio e ristorazione'], [54, 'Com
 const IRPEF = [[28000, 23], [50000, 33], [Infinity, 43]];
 const CASSE = {
   enpab: { label: 'ENPAB (biologi)', sogg: 15, soggMin: 1309, integ: 4, integMin: 106, fissi: 136, massimale: 0,
-    fonte: 'Aliquote 15% e 4% e maternità 136 €: FAQ ENPAB. I minimi 2026 (1.309 € e 106 €) vengono da fonti di settore e NON sono verificati sul sito ENPAB: controllali lì.' },
+    fonte: 'Aliquote 15% e 4% e maternità 136 €: FAQ ENPAB. Minimi 2026 (1.309 € soggettivo, 106 € integrativo): il totale con la maternità coincide con gli avvisi PagoPA ENPAB 2026, ma possono variare con l’anzianità di iscrizione. Conguaglio dal 31 ottobre dell’anno dopo (calendario ENPAB).' },
   inps_gs: { label: 'INPS Gestione Separata', sogg: 26.07, soggMin: 0, integ: 0, integMin: 0, fissi: 0, massimale: 122295,
     fonte: 'Circolare INPS n. 8/2026: 26,07% per i professionisti senza altra copertura (24% se pensionati o già iscritti altrove), massimale 122.295 €. Nessun contributo minimo.' },
   altra: { label: 'Altra cassa (inserisco io)', sogg: 0, soggMin: 0, integ: 0, integMin: 0, fissi: 0, massimale: 0, fonte: 'Inserisci i valori del regolamento della tua cassa.' },
@@ -896,13 +896,14 @@ function computeTax(d, P, N) {
   const Y = String(N), today = todayIso(), cur = Number(today.slice(0, 4));
   const txs = live(d.transactions).filter(t => !isAdj(t));
   const onlyInv = P.only_invoiced !== false;
-  let incassi = 0, spese = 0, contribPagatiN = 0, accontiN = 0, contribPerN = 0;
+  let incassi = 0, spese = 0, contribPagatiN = 0, accontiN = 0, contribPerN = 0, hasData = false;
   for (const t of txs) {
     const c = d.categories[t.category_id], inYear = t.date.startsWith(Y);
-    if (inYear && t.kind === 'income' && c?.scope === 'pro' && (!onlyInv || t.invoiced)) { incassi += +t.amount; spese += +(t.pos_fee || 0); }
+    if (inYear && t.kind === 'income' && c?.scope === 'pro' && (!onlyInv || t.invoiced)) { incassi += +t.amount; spese += +(t.pos_fee || 0); hasData = true; }
     if (inYear && t.kind === 'expense' && c?.scope === 'pro') spese += +t.amount;
     const ti = t.kind === 'expense' ? taxInfo(t, d, P) : null;
     if (!ti) continue;
+    if (inYear || ti.year === N) hasData = true;
     if (inYear && ti.role === 'contributi') contribPagatiN += +t.amount;
     if (ti.year === N && ti.role === 'imposta' && ti.part === 'acconto') accontiN += +t.amount;
     if (ti.year === N && (ti.role === 'contributi' || ti.role === 'integrativo')) contribPerN += +t.amount;
@@ -913,7 +914,7 @@ function computeTax(d, P, N) {
   let factor = 1;
   if (N === cur && P.proietta) { const start = new Date(cur, 0, 1), days = Math.floor((new Date() - start) / 864e5) + 1, tot = (cur % 4 === 0 ? 366 : 365); factor = tot / Math.max(days, 1); }
   const compensi = compensiReali * factor, spesePro = spese * factor;
-  const r = { N, factor, incassi: incassi * factor, compensi, spesePro, contribPagatiN, accontiN, contribPerN, cassa };
+  const r = { N, factor, hasData, incassi: incassi * factor, compensi, spesePro, contribPagatiN, accontiN, contribPerN, cassa };
   if (P.regime === 'forfettario') {
     r.redditoLordo = compensi * num(P.coeff ?? 78) / 100;
     r.imponibile = Math.max(0, r.redditoLordo - contribPagatiN);
@@ -945,7 +946,7 @@ function computeTax(d, P, N) {
   r.novembre = r.acc2;
   r.totale = r.giugno + r.novembre + Math.max(0, r.conguaglio);
   const juneEnd = new Date(N + 1, 5, 30), months = Math.max(1, Math.round((juneEnd - new Date()) / (30.44 * 864e5)));
-  r.mesi = months; r.alMese = (r.giugno + Math.max(0, r.conguaglio)) / months;
+  r.mesi = months; r.alMese = (r.giugno + Math.max(0, r.conguaglio)) / months; r.juneFuture = juneEnd > new Date();
   return r;
 }
 
@@ -960,17 +961,25 @@ function TaxView({ store, openProfile, openTx }) {
   if (!P.regime) return html`<div class="empty" style="margin-top:10px">Imposta il tuo profilo fiscale per vedere quanto mettere da parte per tasse e contributi.<button class="btn" onClick=${openProfile}>Imposta profilo fiscale</button></div>`;
   if (P.regime === 'dipendente') return html`<div><div class="card" style="margin-top:10px"><b>Lavoro dipendente</b><p class="hint">Sul lavoro dipendente le imposte le trattiene il datore di lavoro in busta paga, quindi qui non ci sono versamenti da accantonare. Se hai anche una partita IVA, scegli forfettario o ordinario nel profilo.</p></div><button class="btn sec2" onClick=${openProfile}>Modifica profilo fiscale</button></div>`;
   if (!r) return null;
-  const nx = N + 1;
+  const nx = N + 1, today = todayIso(), past = iso => iso < today;
+  const nav = html`<div class="month"><button class="iconbtn" aria-label="Anno precedente" onClick=${() => setN(N - 1)}>‹</button><h2>Redditi ${N}</h2><button class="iconbtn" aria-label="Anno successivo" onClick=${() => setN(N + 1)} disabled=${N >= cur}>›</button></div>`;
+  if (!r.hasData) return html`<div>${nav}<div class="empty">Nessun incasso di lavoro né versamento di tasse o contributi registrato per il ${N}, quindi non c’è niente da calcolare.${N < cur ? html`<br /><br />Se vuoi il calcolo anche per il ${N}, importa o registra i movimenti di quell’anno.` : ''}</div>
+    ${N < cur && html`<button class="btn sec2" onClick=${() => setN(cur)}>Torna al ${cur}</button>`}</div>`;
+  const isEnpab = P.cassa === 'enpab';
+  const congLabel = isEnpab ? '31 ottobre ' + nx : 'Conguaglio contributi';
+  const congHint = isEnpab ? 'conguaglio ENPAB, anche in 4 rate fino a febbraio' : 'calendario della tua cassa';
+  const congDate = isEnpab ? `${nx}-10-31` : '9999';
+  const tag = iso => past(iso) ? ' (già scaduta)' : '';
   return html`<div>
-    <div class="month"><button class="iconbtn" aria-label="Anno precedente" onClick=${() => setN(N - 1)}>‹</button><h2>Redditi ${N}</h2><button class="iconbtn" aria-label="Anno successivo" onClick=${() => setN(N + 1)} disabled=${N >= cur}>›</button></div>
+    ${nav}
     <div class="card" style="background:var(--btn);color:var(--btnText)"><div style="font-size:.85rem;opacity:.8">Da mettere da parte per i redditi ${N}</div><div class="num" style="font-size:2.2rem;font-weight:800">${eur(r.totale)}</div>
-      <div style="font-size:.9rem;opacity:.9">Circa ${eur(r.alMese)} al mese per arrivare pronto a giugno ${nx}</div></div>
+      <div style="font-size:.9rem;opacity:.9">${r.juneFuture ? `Circa ${eur(r.alMese)} al mese per arrivare pronto a giugno ${nx}` : 'Stima complessiva: alcune scadenze sono già passate, controlla i versamenti registrati qui sotto.'}</div></div>
     ${r.factor > 1.001 && html`<p class="hint">Proiezione a fine anno: incassi e spese di finora moltiplicati per ${String(round2(r.factor)).replace('.', ',')}. Puoi disattivarla nel profilo.</p>`}
     <div class="sec">Scadenze previste</div>
     <div class="card">
-      <${Row} l=${'30 giugno ' + nx} hint="saldo + 1° acconto" v=${eur(r.giugno)} b />
-      <${Row} l=${'30 novembre ' + nx} hint="2° acconto" v=${eur(r.novembre)} b />
-      ${r.cassa.label !== CASSE.nessuna.label && html`<${Row} l="Conguaglio contributi" hint="calendario della tua cassa" v=${eur(Math.max(0, r.conguaglio))} b />`}
+      <${Row} l=${'30 giugno ' + nx} hint=${'saldo + 1° acconto' + tag(nx + '-06-30')} v=${eur(r.giugno)} b />
+      <${Row} l=${'30 novembre ' + nx} hint=${'2° acconto' + tag(nx + '-11-30')} v=${eur(r.novembre)} b />
+      ${r.cassa.label !== CASSE.nessuna.label && html`<${Row} l=${congLabel} hint=${congHint + tag(congDate)} v=${eur(Math.max(0, r.conguaglio))} b />`}
       <p class="hint">Date ordinarie: ogni anno possono esserci proroghe. Il saldo e gli acconti vanno confermati col commercialista.</p></div>
     <div class="sec">Imposta ${N}</div>
     <div class="card">
