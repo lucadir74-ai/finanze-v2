@@ -499,7 +499,8 @@ function CategoryPicker({ store, kind, value, onPick }) {
   const groups = kind === 'income' ? [['pro', 'Lavoro'], ['personal', 'Personale']] : [['pro', 'Lavoro'], ['personal', 'Personale'], ['tax', 'Tasse e contributi']];
   const addNew = () => {
     const name = prompt('Nome della nuova voce'); if (!name || !name.trim()) return;
-    const scope = kind === 'income' ? 'pro' : (confirm('È una spesa di lavoro?\nOK = lavoro, Annulla = personale') ? 'pro' : 'personal');
+    let scope = 'pro';
+    if (kind !== 'income') { const ch = prompt('Di che tipo è?\n1 = Lavoro\n2 = Personale\n3 = Tasse e contributi', '1'); if (ch === null) return; scope = ch.trim() === '2' ? 'personal' : ch.trim() === '3' ? 'tax' : 'pro'; }
     const id = uuid(); store.upsert('categories', { id, name: name.trim(), kind, scope, color: COLORS[cats.length % COLORS.length], sort: 500 + cats.length }); onPick(id);
   };
   return html`<div>${groups.map(([s, l]) => { const g = cats.filter(c => (c.scope || 'personal') === s); return g.length ? html`<div class="grp">${l}</div><div class="chips">${g.map(c => html`<button type="button" class=${'chip' + (c.id === value ? ' on' : '')} onClick=${() => onPick(c.id)}><i class="dot" style=${'--c:' + (c.color || '#999')}></i>${c.name}</button>`)}</div>` : null; })}
@@ -908,13 +909,17 @@ function computeTax(d, P, N) {
     if (ti.year === N && ti.role === 'imposta' && ti.part === 'acconto') accontiN += +t.amount;
     if (ti.year === N && (ti.role === 'contributi' || ti.role === 'integrativo')) contribPerN += +t.amount;
   }
+  const op = P.opening?.[Y] || {};
+  const opInc = num(op.incassi), opSpese = num(op.spese), opContr = num(op.contributi), opAcc = num(op.acconti);
+  if (opInc || opSpese || opContr || opAcc) hasData = true;
+  incassi += opInc; spese += opSpese; contribPagatiN += opContr; contribPerN += opContr; accontiN += opAcc;
   const cassa = CASSE[P.cassa] ? { ...CASSE[P.cassa], ...(P.cassaVals || {}) } : CASSE.nessuna;
   const integPct = num(cassa.integ);
   const compensiReali = P.integ_incluso && integPct ? incassi / (1 + integPct / 100) : incassi;
   let factor = 1;
   if (N === cur && P.proietta) { const start = new Date(cur, 0, 1), days = Math.floor((new Date() - start) / 864e5) + 1, tot = (cur % 4 === 0 ? 366 : 365); factor = tot / Math.max(days, 1); }
   const compensi = compensiReali * factor, spesePro = spese * factor;
-  const r = { N, factor, hasData, incassi: incassi * factor, compensi, spesePro, contribPagatiN, accontiN, contribPerN, cassa };
+  const r = { N, factor, hasData, opening: op, incassi: incassi * factor, compensi, spesePro, contribPagatiN, accontiN, contribPerN, cassa };
   if (P.regime === 'forfettario') {
     r.redditoLordo = compensi * num(P.coeff ?? 78) / 100;
     r.imponibile = Math.max(0, r.redditoLordo - contribPagatiN);
@@ -954,7 +959,7 @@ function Row({ l, v, b, cls, hint }) {
   return html`<div style="display:flex;justify-content:space-between;gap:12px;padding:7px 0;border-bottom:1px solid var(--line)"><span>${l}${hint ? html`<span class="mut" style="font-size:.8rem"> ${hint}</span>` : null}</span><span class=${'num ' + (cls || '')} style=${b ? 'font-weight:800' : ''}>${v}</span></div>`;
 }
 
-function TaxView({ store, openProfile, openTx }) {
+function TaxView({ store, openProfile, openTx, openOpening }) {
   const d = store.data, P = d.settings.tax || {}, cur = Number(todayIso().slice(0, 4));
   const [N, setN] = useState(cur);
   const r = useMemo(() => (P.regime === 'forfettario' || P.regime === 'ordinario') ? computeTax(d, P, N) : null, [store.st.version, N]);
@@ -964,6 +969,7 @@ function TaxView({ store, openProfile, openTx }) {
   const nx = N + 1, today = todayIso(), past = iso => iso < today;
   const nav = html`<div class="month"><button class="iconbtn" aria-label="Anno precedente" onClick=${() => setN(N - 1)}>‹</button><h2>Redditi ${N}</h2><button class="iconbtn" aria-label="Anno successivo" onClick=${() => setN(N + 1)} disabled=${N >= cur}>›</button></div>`;
   if (!r.hasData) return html`<div>${nav}<div class="empty">Nessun incasso di lavoro né versamento di tasse o contributi registrato per il ${N}, quindi non c’è niente da calcolare.${N < cur ? html`<br /><br />Se vuoi il calcolo anche per il ${N}, importa o registra i movimenti di quell’anno.` : ''}</div>
+    <button class="btn" onClick=${() => openOpening(N)}>Inserisci i totali del ${N} prima dell’app</button>
     ${N < cur && html`<button class="btn sec2" onClick=${() => setN(cur)}>Torna al ${cur}</button>`}</div>`;
   const isEnpab = P.cassa === 'enpab';
   const congLabel = isEnpab ? '31 ottobre ' + nx : 'Conguaglio contributi';
@@ -1004,6 +1010,9 @@ function TaxView({ store, openProfile, openTx }) {
       <${Row} l=${'Già versati per il ' + N} v=${'−' + eur(r.contribPerN)} />
       <${Row} l="Conguaglio previsto" v=${eur(r.conguaglio)} b cls=${r.conguaglio < 0 ? 'in' : ''} />
     </div>`}
+    <div class="card" style="margin-top:16px"><b>Mesi prima dell’app</b>
+      <p class="hint">${num(r.opening.incassi) || num(r.opening.contributi) || num(r.opening.acconti) || num(r.opening.spese) ? `Inclusi nel calcolo: incassi ${eur(num(r.opening.incassi))}, contributi versati ${eur(num(r.opening.contributi))}, acconti d’imposta ${eur(num(r.opening.acconti))}${P.regime === 'ordinario' ? ', spese ' + eur(num(r.opening.spese)) : ''}.` : `Se hai iniziato a usare l’app a metà ${N}, inserisci qui i totali dei mesi precedenti: altrimenti la stima sarà troppo bassa.`}</p>
+      <button class="btn sec2" style="margin-top:10px" onClick=${() => openOpening(N)}>${num(r.opening.incassi) ? 'Modifica i totali' : 'Inserisci i totali'}</button></div>
     <div class="sec">Versamenti registrati</div>
     ${(() => {
       const list = live(d.transactions).filter(t => t.kind === 'expense' && !isAdj(t)).map(t => ({ t, ti: taxInfo(t, d, P) }))
@@ -1019,6 +1028,23 @@ function TaxView({ store, openProfile, openTx }) {
     <p class="hint">È una stima basata sui movimenti registrati e sui parametri del profilo. Non sostituisce il calcolo del commercialista.</p>
     <button class="btn sec2" onClick=${openProfile}>Modifica profilo fiscale</button>
   </div>`;
+}
+
+function TaxOpening({ store, year, onClose }) {
+  const P = store.data.settings.tax || {}, o = P.opening?.[String(year)] || {};
+  const [inc, setInc] = useState(fmtIn(o.incassi ?? '')), [sp, setSp] = useState(fmtIn(o.spese ?? '')), [co, setCo] = useState(fmtIn(o.contributi ?? '')), [ac, setAc] = useState(fmtIn(o.acconti ?? ''));
+  const save = () => { const opening = { ...(P.opening || {}), [String(year)]: { incassi: num(inc), spese: num(sp), contributi: num(co), acconti: num(ac) } }; store.setSettings({ tax: { ...P, opening } }); onClose(); };
+  return html`<${Sheet} title=${'Totali ' + year + ' prima dell’app'} onClose=${onClose}>
+    <p class="hint">Solo i mesi che NON hai registrato nell’app, per non contarli due volte. Servono solo al calcolo delle tasse: non cambiano saldi e grafici.</p>
+    <${AmountField} label=${'Incassi di lavoro ' + (P.only_invoiced !== false ? 'fatturati ' : '') + '(€)'} value=${inc} onInput=${setInc} />
+    <p class="hint">Il totale delle fatture incassate in quei mesi: lo trovi nel programma di fatturazione o nel cassetto fiscale.</p>
+    ${P.regime === 'ordinario' && html`<${AmountField} label="Spese di lavoro (€)" value=${sp} onInput=${setSp} />`}
+    <${AmountField} label="Contributi previdenziali versati (€)" value=${co} onInput=${setCo} />
+    <p class="hint">Contributi pagati in quei mesi e non registrati nell’app come movimenti.</p>
+    <${AmountField} label=${'Acconti d’imposta ' + year + ' già versati (€)'} value=${ac} onInput=${setAc} />
+    <p class="hint">Per esempio il 1° acconto pagato a giugno, se non l’hai registrato come movimento.</p>
+    <button class="btn" onClick=${save}>Salva totali</button>
+  <//>`;
 }
 
 function TaxProfile({ store, onClose }) {
@@ -1042,7 +1068,7 @@ function TaxProfile({ store, onClose }) {
   const save = () => {
     const vals = {}; for (const k of Object.keys(cv)) vals[k] = num(cv[k]);
     const rl = {}; for (const c of taxCats) rl[c.id] = roles[c.id] || roleOfCat(c, {});
-    store.setSettings({ tax: { regime, aliquota: num(aliquota), coeff: num(coeff), detrazioni: num(detrazioni), addizionali: num(addizionali), cassa, cassaVals: vals, integ_incluso: integIncl, only_invoiced: onlyInv, proietta, prima_rata: num(primaRata), roles: rl } });
+    store.setSettings({ tax: { ...P0, regime, aliquota: num(aliquota), coeff: num(coeff), detrazioni: num(detrazioni), addizionali: num(addizionali), cassa, cassaVals: vals, integ_incluso: integIncl, only_invoiced: onlyInv, proietta, prima_rata: num(primaRata), roles: rl } });
     onClose();
   };
   const piva = regime === 'forfettario' || regime === 'ordinario';
@@ -1131,7 +1157,7 @@ function Main({ user }) {
     ${tab === 'mov' && html`<${Movements} store=${store} openTx=${t => setSheet({ k: 'tx', v: t })} goTab=${setTab} />`}
     ${tab === 'charts' && html`<${Charts} store=${store} />`}
     ${tab === 'rec' && html`<${Recurring} store=${store} openRec=${r => setSheet({ k: 'rec', v: r })} />`}
-    ${tab === 'tax' && html`<${TaxView} store=${store} openProfile=${() => setSheet({ k: 'taxprofile' })} openTx=${t => setSheet({ k: 'tx', v: t })} />`}
+    ${tab === 'tax' && html`<${TaxView} store=${store} openProfile=${() => setSheet({ k: 'taxprofile' })} openTx=${t => setSheet({ k: 'tx', v: t })} openOpening=${y => setSheet({ k: 'opening', v: y })} />`}
     ${tab === 'set' && html`<${Settings} store=${store} user=${user} open=${k => setSheet({ k })} />`}
     ${(tab === 'mov' || tab === 'charts' || tab === 'tax') && html`<button class="fab" onClick=${() => setSheet({ k: 'tx', v: {} })}>+ Movimento</button>`}
     <nav class="tabs"><div class="in2">${TABS.map(([k, ic, l]) => html`<button class=${tab === k ? 'on' : ''} aria-current=${tab === k ? 'page' : null} onClick=${() => setTab(k)}><span aria-hidden="true">${ic}</span>${l}</button>`)}</div></nav>
@@ -1139,6 +1165,7 @@ function Main({ user }) {
     ${sheet?.k === 'rec' && html`<${RecForm} key=${sheet.v.id || 'new'} store=${store} rec=${sheet.v} onClose=${close} />`}
     ${sheet?.k === 'accounts' && html`<${AccountsEditor} store=${store} onClose=${close} />`}
     ${sheet?.k === 'categories' && html`<${CategoriesEditor} store=${store} onClose=${close} />`}
+    ${sheet?.k === 'opening' && html`<${TaxOpening} store=${store} year=${sheet.v} onClose=${close} />`}
     ${sheet?.k === 'taxprofile' && html`<${TaxProfile} store=${store} onClose=${close} />`}
     ${sheet?.k === 'trash' && html`<${Trash} store=${store} onClose=${close} />`}
     ${sheet?.k === 'snapshots' && html`<${Snapshots} store=${store} onClose=${close} />`}
