@@ -912,7 +912,7 @@ function computeTax(d, P, N) {
   const op = P.opening?.[Y] || {};
   const opInc = num(op.incassi), opSpese = num(op.spese), opContr = num(op.contributi), opAcc = num(op.acconti);
   if (opInc || opSpese || opContr || opAcc) hasData = true;
-  incassi += opInc; spese += opSpese; contribPagatiN += opContr; contribPerN += opContr; accontiN += opAcc;
+  incassi += opInc; spese += opSpese; contribPagatiN += opContr; accontiN += opAcc;
   const cassa = CASSE[P.cassa] ? { ...CASSE[P.cassa], ...(P.cassaVals || {}) } : CASSE.nessuna;
   const integPct = num(cassa.integ);
   const compensiReali = P.integ_incluso && integPct ? incassi / (1 + integPct / 100) : incassi;
@@ -1040,7 +1040,7 @@ function TaxOpening({ store, year, onClose }) {
     <p class="hint">Il totale delle fatture incassate in quei mesi: lo trovi nel programma di fatturazione o nel cassetto fiscale.</p>
     ${P.regime === 'ordinario' && html`<${AmountField} label="Spese di lavoro (€)" value=${sp} onInput=${setSp} />`}
     <${AmountField} label="Contributi previdenziali versati (€)" value=${co} onInput=${setCo} />
-    <p class="hint">Contributi pagati in quei mesi e non registrati nell’app come movimenti.</p>
+    <p class="hint">Contributi pagati in quei mesi e non registrati come movimenti, per qualsiasi anno (per esempio le ultime rate di un conguaglio passato). Riducono l’imponibile di quest’anno ma non il conguaglio della cassa.</p>
     <${AmountField} label=${'Acconti d’imposta ' + year + ' già versati (€)'} value=${ac} onInput=${setAc} />
     <p class="hint">Per esempio il 1° acconto pagato a giugno, se non l’hai registrato come movimento.</p>
     <button class="btn" onClick=${save}>Salva totali</button>
