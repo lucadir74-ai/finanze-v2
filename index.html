@@ -115,6 +115,8 @@ input.big{font-size:2rem;font-weight:800;padding:8px 12px;letter-spacing:-.02em}
 .sw{width:34px;height:34px;border-radius:50%;border:3px solid transparent;cursor:pointer;background:var(--c)}
 .sw.on{border-color:var(--ink)}
 .bars .b{margin:10px 0}
+.bars button.b{display:block;width:100%;background:none;border:0;padding:4px 0;text-align:left;color:inherit;font:inherit;cursor:pointer;border-radius:8px}
+.bars button.b:active{background:var(--soft)}
 .bars .l{display:flex;justify-content:space-between;gap:10px;font-size:.9rem}
 .bars .l span:first-child{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .bars .track{height:10px;background:var(--soft);border-radius:99px;margin-top:4px;overflow:hidden}
@@ -592,17 +594,22 @@ function TxRow({ store, t, onOpen }) {
 }
 
 // ---------- vista movimenti ----------
-function Movements({ store, openTx, goTab }) {
+function Movements({ store, openTx, goTab, init }) {
   const d = store.data;
-  const [ym, setYm] = useState(ymOf(todayIso()));
+  const [ym, setYm] = useState(init?.ym || ymOf(todayIso()));
+  const [mode, setMode] = useState(init?.mode || 'month');
   const [fAcc, setFAcc] = useState('');
-  const [fCat, setFCat] = useState('');
+  const [fCat, setFCat] = useState(init?.cat || '');
+  const year = ym.slice(0, 4);
+  const inPeriod = t => mode === 'month' ? ymOf(t.date) === ym : t.date.startsWith(year);
+  const catOk = t => !fCat || (fCat === '_none' ? (t.kind !== 'transfer' && !isAdj(t) && !t.category_id) : fCat === '_pos' ? +(t.pos_fee || 0) > 0 : t.category_id === fCat);
+  const periodLabel = mode === 'month' ? monthLabel(ym) : 'Anno ' + year;
   const bal = useMemo(() => balances(d), [store.st.version]);
   const accs = live(d.accounts).filter(a => !a.archived || Math.abs(bal[a.id] || 0) > 0.004).sort(bySort);
   const total = Object.values(bal).reduce((x, y) => x + y, 0);
   const reminders = useMemo(() => [...pendingReminders(d), ...taxWindows(d).due], [store.st.version]);
-  const txs = useMemo(() => live(d.transactions).filter(t => ymOf(t.date) === ym && (!fAcc || t.account_id === fAcc || t.to_account_id === fAcc) && (!fCat || t.category_id === fCat))
-    .sort((a, b) => b.date.localeCompare(a.date) || String(b.updated_at).localeCompare(String(a.updated_at))), [store.st.version, ym, fAcc, fCat]);
+  const txs = useMemo(() => live(d.transactions).filter(t => inPeriod(t) && (!fAcc || t.account_id === fAcc || t.to_account_id === fAcc) && catOk(t))
+    .sort((a, b) => b.date.localeCompare(a.date) || String(b.updated_at).localeCompare(String(a.updated_at))), [store.st.version, ym, mode, fAcc, fCat]);
   let inc = 0, exp = 0; for (const t of txs) { if (isAdj(t)) continue; if (t.kind === 'income') { inc += +t.amount; exp += +(t.pos_fee || 0); } else if (t.kind === 'expense') exp += +t.amount; }
   const days = []; for (const t of txs) { const last = days[days.length - 1]; if (last && last.date === t.date) last.items.push(t); else days.push({ date: t.date, items: [t] }); }
   const cats = live(d.categories).sort(bySort);
@@ -612,23 +619,24 @@ function Movements({ store, openTx, goTab }) {
     <div class="accts">${accs.map(a => html`<button class=${'acct' + (fAcc === a.id ? ' on' : '')} style=${'--c:' + (a.color || '#888')} onClick=${() => setFAcc(fAcc === a.id ? '' : a.id)} aria-pressed=${fAcc === a.id}>
       <div class="n">${(a.icon ? a.icon + ' ' : '') + a.name}</div><div class="v num">${eur(bal[a.id])}</div></button>`)}</div>
     ${reminders.length > 0 && html`<button class="banner" onClick=${() => goTab('rec')}><span>${reminders.length === 1 ? '1 pagamento da registrare' : reminders.length + ' pagamenti da registrare'}</span><span>›</span></button>`}
-    <div class="month"><button class="iconbtn" aria-label="Mese precedente" onClick=${() => setYm(addMonths(ym, -1))}>‹</button><h2>${monthLabel(ym)}</h2><button class="iconbtn" aria-label="Mese successivo" onClick=${() => setYm(addMonths(ym, 1))}>›</button></div>
+    <div class="month"><button class="iconbtn" aria-label="Indietro" onClick=${() => setYm(addMonths(ym, mode === 'month' ? -1 : -12))}>‹</button><h2>${periodLabel}</h2><button class="iconbtn" aria-label="Avanti" onClick=${() => setYm(addMonths(ym, mode === 'month' ? 1 : 12))}>›</button></div>
     <div class="totals num"><div><small>Entrate</small><b class="in">${eur(inc)}</b></div><div><small>Uscite</small><b class="out">${eur(exp)}</b></div><div><small>Differenza</small><b>${eur(inc - exp)}</b></div></div>
-    <div class="filters"><select aria-label="Filtra per voce" value=${fCat} onChange=${e => setFCat(e.target.value)}><option value="">Tutte le voci</option>${cats.map(c => html`<option value=${c.id}>${c.name}</option>`)}</select>
-      ${(fAcc || fCat) && html`<button class="linkbtn" onClick=${() => { setFAcc(''); setFCat(''); }}>Togli filtri</button>`}</div>
-    ${days.length === 0 ? html`<div class="empty" style="margin-top:12px">Nessun movimento in ${monthLabel(ym)}.<br/>Tocca “+ Movimento” per aggiungerne uno.</div>`
+    <div class="filters"><select aria-label="Filtra per voce" value=${fCat} onChange=${e => setFCat(e.target.value)}><option value="">Tutte le voci</option>${cats.map(c => html`<option value=${c.id}>${c.name}</option>`)}<option value="_none">Senza voce</option><option value="_pos">Commissioni POS</option></select>
+      ${(fAcc || fCat || mode === 'year') && html`<button class="linkbtn" onClick=${() => { setFAcc(''); setFCat(''); setMode('month'); }}>Togli filtri</button>`}</div>
+    ${mode === 'year' && html`<p class="hint">Stai vedendo tutto l’anno ${year}. <button class="linkbtn" onClick=${() => setMode('month')}>Mostra solo il mese</button></p>`}
+    ${days.length === 0 ? html`<div class="empty" style="margin-top:12px">Nessun movimento in ${periodLabel}.<br/>Tocca “+ Movimento” per aggiungerne uno.</div>`
       : days.map(g => html`<div class="day">${dayLabel(g.date)}</div><div class="list">${g.items.map(t => html`<${TxRow} key=${t.id} store=${store} t=${t} onOpen=${openTx} />`)}</div>`)}
   </div>`;
 }
 
 // ---------- vista grafici ----------
-function Bars({ rows, total }) {
+function Bars({ rows, total, onPick }) {
   if (!rows.length) return html`<div class="empty">Nessun dato nel periodo.</div>`;
   const max = Math.max(...rows.map(r => r.v));
-  return html`<div class="card bars">${rows.map(r => html`<div class="b"><div class="l"><span>${r.name}</span><span class="num"><b>${eur(r.v)}</b> <span class="mut">${total ? Math.round(r.v / total * 100) : 0}%</span></span></div>
-    <div class="track"><div class="fill" style=${`--c:${r.color || '#888'};width:${max ? Math.max(2, r.v / max * 100) : 0}%`}></div></div></div>`)}</div>`;
+  return html`<div class="card bars">${rows.map(r => html`<button type="button" class="b" onClick=${() => onPick && onPick(r.id)} aria-label=${`${r.name}: ${eur(r.v)}. Apri i movimenti di questa voce`}><div class="l"><span>${r.name}</span><span class="num"><b>${eur(r.v)}</b> <span class="mut">${total ? Math.round(r.v / total * 100) : 0}%</span> <span class="mut">›</span></span></div>
+    <div class="track"><div class="fill" style=${`--c:${r.color || '#888'};width:${max ? Math.max(2, r.v / max * 100) : 0}%`}></div></div></button>`)}</div>`;
 }
-function Charts({ store }) {
+function Charts({ store, goMov }) {
   const d = store.data;
   const [ym, setYm] = useState(ymOf(todayIso()));
   const [mode, setMode] = useState('month');
@@ -642,19 +650,21 @@ function Charts({ store }) {
       if (t.kind === 'expense') { ex[key] = (ex[key] || 0) + +t.amount; scope[c?.scope || 'personal'] += +t.amount; }
       else { inc[key] = (inc[key] || 0) + +t.amount; if (t.pos_fee) { posFees += +t.pos_fee; scope.pro += +t.pos_fee; } }
     }
-    const toRows = o => Object.entries(o).map(([id, v]) => ({ name: d.categories[id]?.name || 'Senza voce', color: d.categories[id]?.color, v: round2(v) })).sort((a, b) => b.v - a.v);
-    const exRows = toRows(ex); if (posFees) { exRows.push({ name: 'Commissioni POS', color: '#4B5563', v: round2(posFees) }); exRows.sort((a, b) => b.v - a.v); }
+    const toRows = o => Object.entries(o).map(([id, v]) => ({ id, name: d.categories[id]?.name || 'Senza voce', color: d.categories[id]?.color, v: round2(v) })).sort((a, b) => b.v - a.v);
+    const exRows = toRows(ex); if (posFees) { exRows.push({ id: '_pos', name: 'Commissioni POS', color: '#4B5563', v: round2(posFees) }); exRows.sort((a, b) => b.v - a.v); }
     const trend = []; for (let i = 11; i >= 0; i--) { const m = addMonths(ym, -i); let a = 0, b = 0; for (const t of live(d.transactions)) { if (ymOf(t.date) !== m || isAdj(t)) continue; if (t.kind === 'income') { a += +t.amount; b += +(t.pos_fee || 0); } else if (t.kind === 'expense') b += +t.amount; } trend.push({ m, a, b }); }
     return { exRows, inRows: toRows(inc), scope, trend };
   }, [store.st.version, ym, mode]);
   const exTot = data.exRows.reduce((s, r) => s + r.v, 0), inTot = data.inRows.reduce((s, r) => s + r.v, 0);
   const tmax = Math.max(1, ...data.trend.flatMap(x => [x.a, x.b]));
+  const pick = id => goMov({ ym, mode, cat: id });
   return html`<div>
     <div class="seg" style="margin-top:6px"><button class=${mode === 'month' ? 'on' : ''} onClick=${() => setMode('month')}>Mese</button><button class=${mode === 'year' ? 'on' : ''} onClick=${() => setMode('year')}>Anno</button></div>
     <div class="month"><button class="iconbtn" aria-label="Indietro" onClick=${() => setYm(addMonths(ym, mode === 'month' ? -1 : -12))}>‹</button><h2>${mode === 'month' ? monthLabel(ym) : 'Anno ' + year}</h2><button class="iconbtn" aria-label="Avanti" onClick=${() => setYm(addMonths(ym, mode === 'month' ? 1 : 12))}>›</button></div>
     <div class="scope3 num"><div><small>Lavoro</small><b>${eur(data.scope.pro)}</b></div><div><small>Personale</small><b>${eur(data.scope.personal)}</b></div><div><small>Tasse e contr.</small><b class="tx">${eur(data.scope.tax)}</b></div></div>
-    <div class="sec">Uscite per voce <span class="mut num" style="font-weight:500">${eur(exTot)}</span></div><${Bars} rows=${data.exRows} total=${exTot} />
-    <div class="sec">Entrate per voce <span class="mut num" style="font-weight:500">${eur(inTot)}</span></div><${Bars} rows=${data.inRows} total=${inTot} />
+    <div class="sec">Uscite per voce <span class="mut num" style="font-weight:500">${eur(exTot)}</span></div><${Bars} rows=${data.exRows} total=${exTot} onPick=${pick} />
+    <div class="sec">Entrate per voce <span class="mut num" style="font-weight:500">${eur(inTot)}</span></div><${Bars} rows=${data.inRows} total=${inTot} onPick=${pick} />
+    <p class="hint">Tocca una voce per vedere i suoi movimenti.</p>
     <div class="sec">Ultimi 12 mesi</div>
     <div class="card"><div class="trend">${data.trend.map(x => html`<button class=${'m' + (x.m === ym ? ' on' : '')} onClick=${() => { setMode('month'); setYm(x.m); }} aria-label=${`${monthLabel(x.m)}: entrate ${eur(x.a)}, uscite ${eur(x.b)}`}>
       <div class="pair"><i style=${`height:${x.a / tmax * 100}%;background:var(--in)`}></i><i style=${`height:${x.b / tmax * 100}%;background:var(--out)`}></i></div><small>${MSHORT[+x.m.slice(5) - 1]}</small></button>`)}</div>
@@ -1272,7 +1282,8 @@ function Main({ user }) {
   const store = useMemo(() => createStore(user.id), [user.id]);
   const [, force] = useState(0);
   useEffect(() => { const un = store.subscribe(() => force(x => x + 1)); store.start(); return () => { un(); store.stop(); }; }, [store]);
-  const [tab, setTab] = useState('mov'), [sheet, setSheet] = useState(null);
+  const [tab, setTab] = useState('mov'), [sheet, setSheet] = useState(null), [movInit, setMovInit] = useState(null);
+  const goMov = f => { setMovInit({ ...f, n: Date.now() }); setTab('mov'); window.scrollTo(0, 0); };
   const d = store.data, st = store.st, hasAcc = live(d.accounts).length > 0;
   if (!hasAcc && !st.loaded) return html`<div class="center"><p class="brand">Finanze</p><p class="mut">${st.error || 'Caricamento dei tuoi dati…'}</p>${st.error && html`<button class="btn" onClick=${() => store.pull()}>Riprova</button>`}</div>`;
   if (!hasAcc) return html`<${Welcome} store=${store} />`;
@@ -1280,13 +1291,13 @@ function Main({ user }) {
   const TABS = [['mov', '☰', 'Movimenti'], ['charts', '▤', 'Grafici'], ['tax', '%', 'Tasse'], ['rec', '↻', 'Ricorrenti'], ['set', '⚙', 'Impostazioni']];
   return html`<div class="wrap">
     <div class="top"><h1>${TABS.find(t => t[0] === tab)[2]}</h1><${SyncPill} store=${store} /></div>
-    ${tab === 'mov' && html`<${Movements} store=${store} openTx=${t => setSheet({ k: 'tx', v: t })} goTab=${setTab} />`}
-    ${tab === 'charts' && html`<${Charts} store=${store} />`}
+    ${tab === 'mov' && html`<${Movements} key=${movInit?.n || 0} init=${movInit} store=${store} openTx=${t => setSheet({ k: 'tx', v: t })} goTab=${setTab} />`}
+    ${tab === 'charts' && html`<${Charts} store=${store} goMov=${goMov} />`}
     ${tab === 'rec' && html`<${Recurring} store=${store} openRec=${r => setSheet({ k: 'rec', v: r })} openPlan=${dl => setSheet({ k: 'plan', v: dl })} />`}
     ${tab === 'tax' && html`<${TaxView} store=${store} openProfile=${() => setSheet({ k: 'taxprofile' })} openTx=${t => setSheet({ k: 'tx', v: t })} openOpening=${y => setSheet({ k: 'opening', v: y })} />`}
     ${tab === 'set' && html`<${Settings} store=${store} user=${user} open=${k => setSheet({ k })} />`}
     ${(tab === 'mov' || tab === 'charts' || tab === 'tax') && html`<button class="fab" onClick=${() => setSheet({ k: 'tx', v: {} })}>+ Movimento</button>`}
-    <nav class="tabs"><div class="in2">${TABS.map(([k, ic, l]) => html`<button class=${tab === k ? 'on' : ''} aria-current=${tab === k ? 'page' : null} onClick=${() => setTab(k)}><span aria-hidden="true">${ic}</span>${l}</button>`)}</div></nav>
+    <nav class="tabs"><div class="in2">${TABS.map(([k, ic, l]) => html`<button class=${tab === k ? 'on' : ''} aria-current=${tab === k ? 'page' : null} onClick=${() => { if (k === 'mov') setMovInit(null); setTab(k); }}><span aria-hidden="true">${ic}</span>${l}</button>`)}</div></nav>
     ${sheet?.k === 'tx' && html`<${TxForm} key=${sheet.v.id || 'new'} store=${store} tx=${sheet.v} onClose=${close} />`}
     ${sheet?.k === 'rec' && html`<${RecForm} key=${sheet.v.id || 'new'} store=${store} rec=${sheet.v} onClose=${close} />`}
     ${sheet?.k === 'accounts' && html`<${AccountsEditor} store=${store} onClose=${close} />`}
