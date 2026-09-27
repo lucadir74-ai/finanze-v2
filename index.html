@@ -3,7 +3,9 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<meta name="theme-color" content="#13302E">
+<meta name="theme-color" content="#EDF2F0" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#0D1817" media="(prefers-color-scheme: dark)">
+<meta name="format-detection" content="telephone=no">
 <meta name="mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="default">
@@ -140,6 +142,23 @@ input.big{font-size:2rem;font-weight:800;padding:8px 12px;letter-spacing:-.02em}
 .setrow:first-child{border-radius:12px 12px 0 0}.setrow:last-child{border-radius:0 0 12px 12px;border-bottom:0}
 .setrow:only-child{border-radius:12px}
 .setrow small{color:var(--muted)}
+/* ---- iOS ---- */
+html{-webkit-text-size-adjust:100%;text-size-adjust:100%}
+body{-webkit-tap-highlight-color:transparent}
+.wrap{padding-left:max(16px,env(safe-area-inset-left,0px));padding-right:max(16px,env(safe-area-inset-right,0px))}
+nav.tabs{padding-left:env(safe-area-inset-left,0px);padding-right:env(safe-area-inset-right,0px)}
+nav.tabs,.fab,.acct,.seg,.chip,.setrow,.iconbtn{-webkit-user-select:none;user-select:none;-webkit-touch-callout:none}
+@media (hover:none){.btn:active,.row:active,.acct:active,.chip:active,.setrow:active,.iconbtn:active,.fab:active,nav.tabs button:active,.seg button:active{opacity:.6}}
+select,select.i{-webkit-appearance:none;appearance:none;background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'%3E%3Cpath d='M1 1l5 5 5-5' fill='none' stroke='%235D716E' stroke-width='2' stroke-linecap='round'/%3E%3C/svg%3E");background-repeat:no-repeat;background-position:right 12px center;padding-right:34px}
+input[type=date].i{-webkit-appearance:none;appearance:none;min-height:47px;text-align:left}
+input[type=date]::-webkit-date-and-time-value{text-align:left;margin:0}
+input.i,select.i,textarea.i{font-size:max(16px,1rem)}
+input.big{font-size:2rem}
+.ov{top:var(--vvt,0px);bottom:auto;height:var(--vvh,100%)}
+.sheet{overscroll-behavior:contain;-webkit-overflow-scrolling:touch;max-height:calc(var(--vvh,100vh) * .92)}
+@media (min-width:640px){.sheet{max-height:calc(var(--vvh,100vh) * .88)}}
+.ioshint{display:flex;gap:10px;align-items:flex-start;background:var(--card);border-radius:12px;padding:12px 14px;margin:6px 0 10px;font-size:.9rem}
+.ioshint b{display:block;margin-bottom:2px}
 @media (prefers-reduced-motion:no-preference){.sheet{animation:up .22s ease-out}@keyframes up{from{transform:translateY(24px);opacity:.6}to{transform:none;opacity:1}}}
 </style>
 </head>
@@ -161,6 +180,19 @@ const SUPABASE_ANON_KEY = 'sb_publishable_dkd-ZmZt8LkvFx86VWTgmQ_D8QFJewS';
 
 const CONFIGURED = /^https:\/\//.test(SUPABASE_URL) && SUPABASE_ANON_KEY.length > 30;
 const sb = CONFIGURED ? createClient(SUPABASE_URL, SUPABASE_ANON_KEY, { db: { schema: 'finanze' }, auth: { persistSession: true, autoRefreshToken: true, detectSessionInUrl: true, storageKey: 'finanze-auth' } }) : null;
+
+// ---------- iOS: tastiera e viewport ----------
+const IS_IOS = /iPad|iPhone|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+const IS_STANDALONE = navigator.standalone === true || !!window.matchMedia?.('(display-mode: standalone)')?.matches;
+if (window.visualViewport) {
+  const vv = window.visualViewport, root = document.documentElement.style;
+  const setVV = () => { root.setProperty('--vvh', vv.height + 'px'); root.setProperty('--vvt', vv.offsetTop + 'px'); };
+  vv.addEventListener('resize', setVV); vv.addEventListener('scroll', setVV); setVV();
+}
+document.addEventListener('focusin', e => {
+  const el = e.target; if (!el.matches?.('input,select,textarea') || !el.closest('.sheet')) return;
+  setTimeout(() => { try { el.scrollIntoView({ block: 'center', behavior: 'smooth' }); } catch {} }, 300);
+});
 
 // ---------- utilità ----------
 const $eur = new Intl.NumberFormat('it-IT', { style: 'currency', currency: 'EUR' });
@@ -661,7 +693,7 @@ function TxForm({ store, tx, onClose }) {
       ${pos && html`<div class="two"><${AmountField} label="Commissione %" value=${posPct} onInput=${setPosPct} /><${AmountField} label="Costo fisso (€)" value=${posFixed} onInput=${setPosFixed} /></div>
         <div class="calc num">Commissione ${eur(fee)}, accreditato sul conto ${eur(a > 0 ? a - fee : 0)}</div>
         ${!s.pos_pct && html`<p class="hint">Puoi salvare la tua commissione abituale nelle impostazioni, così la trovi già compilata.</p>`}`}`}
-    <div class="two"><label class="f"><span>Data</span><input class="i" type="date" value=${date} onInput=${e => setDate(e.target.value)} /></label>
+    <div class="two"><label class="f"><span>Data</span><input class="i" type="date" value=${date} onInput=${e => setDate(e.target.value)} onChange=${e => setDate(e.target.value)} /></label>
       <${AccountSelect} store=${store} value=${acc} onChange=${setAcc} label=${kind === 'transfer' ? 'Da conto' : live(d.accounts).some(isCard) ? 'Conto o carta' : 'Conto'} /></div>
     ${ppAcc && html`<label class="f"><span>Pagato con</span><select class="i" value=${fundV} onChange=${e => setFund(e.target.value)}><option value="">Saldo PayPal</option>
         ${live(d.accounts).filter(x => !x.archived && !isPaypal(x) || x.id === fundV).sort(bySort).map(x => html`<option value=${x.id}>${(x.icon ? x.icon + ' ' : '') + x.name}</option>`)}</select></label>
@@ -849,8 +881,8 @@ function RecForm({ store, rec, onClose }) {
     <div style="margin-top:16px" class="seg"><button class=${freq === 'monthly' ? 'on' : ''} onClick=${() => setFreq('monthly')}>Ogni mese</button><button class=${freq === 'yearly' ? 'on' : ''} onClick=${() => setFreq('yearly')}>Ogni anno</button></div>
     <div class="two"><label class="f"><span>Giorno</span><input class="i num" inputmode="numeric" value=${day} onInput=${e => setDay(e.target.value)} /></label>
       ${freq === 'yearly' ? html`<label class="f"><span>Mese</span><select class="i" value=${month} onChange=${e => setMonth(e.target.value)}>${MONTHS.map((m, i) => html`<option value=${i + 1}>${m}</option>`)}</select></label>`
-        : html`<label class="f"><span>A partire dal</span><input class="i" type="date" value=${start} onInput=${e => setStart(e.target.value)} /></label>`}</div>
-    ${freq === 'yearly' && html`<label class="f"><span>A partire dal</span><input class="i" type="date" value=${start} onInput=${e => setStart(e.target.value)} /></label>`}
+        : html`<label class="f"><span>A partire dal</span><input class="i" type="date" value=${start} onInput=${e => setStart(e.target.value)} onChange=${e => setStart(e.target.value)} /></label>`}</div>
+    ${freq === 'yearly' && html`<label class="f"><span>A partire dal</span><input class="i" type="date" value=${start} onInput=${e => setStart(e.target.value)} onChange=${e => setStart(e.target.value)} /></label>`}
     <div style="margin-top:16px" class="seg"><button class=${auto ? 'on' : ''} onClick=${() => setAuto(true)}>Registra da sola</button><button class=${!auto ? 'on' : ''} onClick=${() => setAuto(false)}>Solo promemoria</button></div>
     <p class="hint">${auto ? 'Il movimento viene aggiunto in automatico alla data prevista.' : 'Alla scadenza ti viene chiesto di registrarlo, così puoi correggere l’importo.'}</p>
     ${kind === 'income' && html`<label class="check"><input type="checkbox" checked=${invoiced} onChange=${e => setInvoiced(e.target.checked)} />Con fattura</label>`}
@@ -1569,6 +1601,16 @@ function Guide({ store, onDone }) {
   </div>`;
 }
 
+// ---------- suggerimento installazione su iPhone/iPad ----------
+function IosInstallHint() {
+  const [hide, setHide] = useState(() => { try { return localStorage.getItem('fz2:ioshint') === 'no'; } catch { return false; } });
+  if (!IS_IOS || IS_STANDALONE || hide) return null;
+  const close = () => { try { localStorage.setItem('fz2:ioshint', 'no'); } catch {} setHide(true); };
+  return html`<div class="ioshint" role="note"><div style="flex:1"><b>Installala come app</b>
+    In Safari tocca il pulsante Condividi (su iOS 26 si trova nel menu ··· in basso), poi “Aggiungi alla schermata Home”. Dall’icona si apre a schermo intero; al primo avvio dovrai rifare l’accesso.</div>
+    <button class="x" onClick=${close} aria-label="Non mostrare più">✕</button></div>`;
+}
+
 // ---------- app principale ----------
 function Main({ user }) {
   const store = useMemo(() => createStore(user.id), [user.id]);
@@ -1584,6 +1626,7 @@ function Main({ user }) {
   const TABS = [['mov', '☰', 'Movimenti'], ['charts', '▤', 'Grafici'], ['tax', '%', 'Tasse'], ['rec', '↻', 'Ricorrenti'], ['set', '⚙', 'Impostazioni']];
   return html`<div class="wrap">
     <div class="top"><h1>${TABS.find(t => t[0] === tab)[2]}</h1><${SyncPill} store=${store} /></div>
+    <${IosInstallHint} />
     ${tab === 'mov' && html`<${Movements} key=${movInit?.n || 0} init=${movInit} store=${store} openTx=${t => setSheet({ k: 'tx', v: t })} goTab=${setTab} />`}
     ${tab === 'charts' && html`<${Charts} store=${store} goMov=${goMov} />`}
     ${tab === 'rec' && html`<${Recurring} store=${store} openRec=${r => setSheet({ k: 'rec', v: r })} openPlan=${dl => setSheet({ k: 'plan', v: dl })} />`}
