@@ -335,7 +335,7 @@ function createStore(uid) {
   const persist = () => { const a = lsSet(kC, data), b = lsSet(kQ, queue); st.cacheOk = a && b; };
   const enqueue = (table, id, row) => { queue = queue.filter(q => !(q.table === table && q.id === id)); queue.push({ table, id, row }); };
   let noTaxCols = false;
-  let timer = null; const schedule = () => { clearTimeout(timer); timer = setTimeout(flush, 350); };
+  let stopped = false, timer = null; const schedule = () => { clearTimeout(timer); timer = setTimeout(flush, 350); };
 
   function upsertMany(table, rows) {
     const now = new Date().toISOString();
@@ -349,7 +349,7 @@ function createStore(uid) {
   }
 
   async function flush() {
-    if (st.flushing || !queue.length || !sb) return;
+    if (stopped || st.flushing || !queue.length || !sb) return;
     st.flushing = true; emit();
     try {
       while (queue.length) {
@@ -443,12 +443,13 @@ function createStore(uid) {
     subscribe(f) { subs.add(f); return () => subs.delete(f); },
     upsert, upsertMany, setSettings, flush, pull, applyRecurring, exportObj, snapshot,
     start() {
+      stopped = false;
       navigator.storage?.persist?.().catch(() => {});
       addEventListener('online', onOnline); addEventListener('offline', onOffline); document.addEventListener('visibilitychange', onVis);
       iv = setInterval(() => { if (queue.length) flush(); }, 30000);
       pull().then(afterLoad);
     },
-    stop() { removeEventListener('online', onOnline); removeEventListener('offline', onOffline); document.removeEventListener('visibilitychange', onVis); clearInterval(iv); },
+    stop() { stopped = true; clearTimeout(timer); removeEventListener('online', onOnline); removeEventListener('offline', onOffline); document.removeEventListener('visibilitychange', onVis); clearInterval(iv); },
   };
 }
 
@@ -1418,8 +1419,37 @@ function Settings({ store, user, open }) {
       <button class="setrow" onClick=${() => open('snapshots')}><span>Copie automatiche</span><small>›</small></button>
       <button class="setrow" onClick=${() => open('trash')}><span>Cestino</span><small>›</small></button></div>
     <div class="sec">Account</div>
-    <div class="card"><div>${user.email}</div><p class="hint">I dati sono salvati sul server e protetti dal tuo account: li ritrovi su qualsiasi dispositivo.</p><button class="btn danger" onClick=${logout}>Esci</button></div>
+    <div class="card"><div>${user.email}</div><p class="hint">I dati sono salvati sul server e protetti dal tuo account: li ritrovi su qualsiasi dispositivo.</p><button class="btn danger" onClick=${logout}>Esci</button><button class="linkbtn" style="margin-top:14px" onClick=${() => open('deleteacc')}>Elimina account e dati</button></div>
   </div>`;
+}
+
+// ---------- eliminazione account ----------
+function DeleteAccount({ store, user, onClose }) {
+  const [word, setWord] = useState(''), [busy, setBusy] = useState(false), [err, setErr] = useState(''), [saved, setSaved] = useState(false);
+  const backup = async () => { await shareOrDownload(store.exportObj(), 'finanze-backup-' + todayIso() + '.json'); setSaved(true); };
+  const run = async () => {
+    setErr('');
+    if (word.trim().toUpperCase() !== 'ELIMINA') return setErr('Per confermare scrivi ELIMINA nel campo qui sopra.');
+    if (!navigator.onLine) return setErr('Serve la connessione a internet per eliminare l’account.');
+    if (!confirm('Ultima conferma: eliminare definitivamente account e dati? Non si può annullare.')) return;
+    setBusy(true);
+    store.stop();
+    const { error } = await sb.rpc('delete_my_account');
+    if (error) { setBusy(false); store.start(); return setErr('Eliminazione non riuscita: ' + (error.message || error) + '. Il tuo account e i dati sono ancora al loro posto.'); }
+    for (const k of ['fz2:cache:', 'fz2:queue:', 'fz2:snap:']) { try { localStorage.removeItem(k + user.id); } catch {} }
+    try { await sb.auth.signOut({ scope: 'local' }); } catch {}
+    try { localStorage.removeItem('finanze-auth'); } catch {}
+    alert('Account eliminato. Tutti i tuoi dati sono stati cancellati dal server e da questo dispositivo.');
+    location.reload();
+  };
+  return html`<${Sheet} title="Elimina account" onClose=${onClose}>
+    <p>Vengono cancellati per sempre, dal server e da questo dispositivo: conti, carte, movimenti, ricorrenti, voci, impostazioni, profilo fiscale, copie automatiche e l’account ${user.email}.</p>
+    <p class="hint">Se pensi di tornare, o di passare i dati altrove, scarica prima un backup: potrai reimportarlo in un nuovo account.</p>
+    <button class="btn sec2" onClick=${backup}>${saved ? 'Backup scaricato, scaricalo di nuovo' : 'Scarica un backup'}</button>
+    <label class="f"><span>Per confermare scrivi ELIMINA</span><input class="i" value=${word} onInput=${e => setWord(e.target.value)} autocomplete="off" autocapitalize="characters" /></label>
+    ${err && html`<div class="err" role="alert">${err}</div>`}
+    <button class="btn danger" disabled=${busy} onClick=${run}>${busy ? 'Eliminazione in corso…' : 'Elimina definitivamente'}</button>
+  <//>`;
 }
 
 // ---------- benvenuto (primo accesso) ----------
@@ -1570,6 +1600,7 @@ function Main({ user }) {
     ${sheet?.k === 'taxprofile' && html`<${TaxProfile} store=${store} onClose=${close} />`}
     ${sheet?.k === 'trash' && html`<${Trash} store=${store} onClose=${close} />`}
     ${sheet?.k === 'snapshots' && html`<${Snapshots} store=${store} onClose=${close} />`}
+    ${sheet?.k === 'deleteacc' && html`<${DeleteAccount} store=${store} user=${user} onClose=${close} />`}
   </div>`;
 }
 
