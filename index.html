@@ -190,9 +190,9 @@ const SCOPES = { pro: 'Lavoro', personal: 'Personale', tax: 'Tasse e contributi'
 // ---------- modello dati ----------
 const TABLES = ['accounts', 'categories', 'transactions', 'recurring'];
 const COLS = {
-  accounts: { user_id: null, id: null, name: '', icon: null, color: null, initial_balance: 0, sort: 0, archived: false, deleted: false },
+  accounts: { user_id: null, id: null, name: '', icon: null, color: null, initial_balance: 0, sort: 0, archived: false, deleted: false, type: 'bank', charge_day: null, close_day: null, charge_account_id: null, card_limit: null, card_since: null },
   categories: { user_id: null, id: null, name: '', kind: 'expense', scope: 'personal', color: null, sort: 0, archived: false, deleted: false },
-  transactions: { user_id: null, id: null, date: null, kind: 'expense', amount: 0, account_id: null, to_account_id: null, category_id: null, note: null, invoiced: false, pos: false, pos_pct: null, pos_fixed: null, pos_fee: null, recurring_id: null, tax_year: null, tax_part: null, deleted: false },
+  transactions: { user_id: null, id: null, date: null, kind: 'expense', amount: 0, account_id: null, to_account_id: null, category_id: null, note: null, invoiced: false, pos: false, pos_pct: null, pos_fixed: null, pos_fee: null, recurring_id: null, tax_year: null, tax_part: null, deleted: false, fund_account_id: null, inst_n: null, inst_first: null },
   recurring: { user_id: null, id: null, kind: 'expense', amount: 0, account_id: null, to_account_id: null, category_id: null, note: null, freq: 'monthly', day: 1, month: null, start_date: null, auto: true, active: true, invoiced: false, deleted: false },
 };
 const clean = (t, r) => { const o = {}; for (const [c, def] of Object.entries(COLS[t])) o[c] = r[c] === undefined ? def : r[c]; return o; };
@@ -211,6 +211,85 @@ function balances(d) {
   for (const a of live(d.accounts)) b[a.id] = Number(a.initial_balance) || 0;
   for (const t of live(d.transactions)) for (const [acc, v] of effects(t)) if (acc in b) b[acc] = round2(b[acc] + v);
   return b;
+}
+
+// ---------- carte di credito ----------
+const isCard = a => a?.type === 'card';
+// Saldo di un conto/carta a una certa data (movimenti fino a quel giorno compreso)
+function balanceAt(d, accId, until) {
+  let b = Number(d.accounts[accId]?.initial_balance) || 0;
+  for (const t of live(d.transactions)) { if (t.date > until) continue; for (const [acc, v] of effects(t)) if (acc === accId) b += v; }
+  return round2(b);
+}
+// Ciclo della carta con addebito nel mese ym: chiusura nel mese precedente (giorno scelto o fine mese)
+function cardCycle(card, ym) {
+  const [y, m] = ym.split('-').map(Number), pym = addMonths(ym, -1), [py, pm] = pym.split('-').map(Number);
+  const charge = `${ym}-${pad(Math.min(Number(card.charge_day) || 15, daysIn(y, m)))}`;
+  const close = `${pym}-${pad(Math.min(Number(card.close_day) || 31, daysIn(py, pm)))}`;
+  return { ym, charge, close, id: `cc:${card.id}:${ym}` };
+}
+// Addebiti dovuti (data di addebito già arrivata) e non ancora registrati
+function dueCardCharges(d) {
+  const today = todayIso(), rows = [];
+  for (const card of live(d.accounts)) {
+    if (!isCard(card) || !card.charge_account_id || !d.accounts[card.charge_account_id] || d.accounts[card.charge_account_id].deleted) continue;
+    const since = card.card_since || today, added = [];
+    for (let ym = ymOf(since), i = 0; ym <= ymOf(today) && i < 240; ym = addMonths(ym, 1), i++) {
+      const c = cardCycle(card, ym);
+      if (c.charge < since || c.charge > today || d.transactions[c.id]) continue;
+      // conta anche gli addebiti appena calcolati in questo giro (se l'app non si apriva da mesi)
+      const amt = round2(-balanceAt(d, card.id, c.close) - added.filter(r => r.date <= c.close).reduce((x, r) => x + r.amount, 0));
+      if (amt > 0.004) added.push({ date: c.charge, amount: amt }), rows.push({ id: c.id, date: c.charge, kind: 'transfer', amount: amt, account_id: card.charge_account_id, to_account_id: card.id, category_id: null, note: `Addebito carta ${card.name}, spese fino al ${shortDate(c.close)}`, deleted: false });
+    }
+  }
+  return rows;
+}
+// Riepilogo per la vista della carta: prossimo addebito e spese del ciclo successivo
+function cardStatus(d, card) {
+  const today = todayIso(), bal = balances(d)[card.id] ?? 0, debt = round2(Math.max(0, -bal));
+  let c = cardCycle(card, ymOf(today)); if (c.charge <= today) c = cardCycle(card, addMonths(ymOf(today), 1));
+  const nextAmt = round2(Math.min(debt, Math.max(0, -balanceAt(d, card.id, c.close))));
+  const after = cardCycle(card, addMonths(c.ym, 1));
+  const limit = Number(card.card_limit) || 0;
+  return { debt, next: c, nextAmt, after, afterAmt: round2(debt - nextAmt), avail: limit ? round2(limit - debt) : null, limit };
+}
+
+// ---------- PayPal e pagamenti a rate ----------
+const isPaypal = a => a?.type === 'paypal';
+const isPpRow = t => String(t.id).startsWith('pp:');
+const addMonthsIso = (iso, n) => { const [y, m, dd] = iso.split('-').map(Number), ym = addMonths(`${y}-${pad(m)}`, n), [yy, mm] = ym.split('-').map(Number); return `${ym}-${pad(Math.min(dd, daysIn(yy, mm)))}`; };
+// Piano dei prelievi di un pagamento PayPal: una riga per rata (una sola se non è a rate)
+function ppPlan(t) {
+  const n = Math.max(1, Number(t.inst_n) || 1), tot = Number(t.amount) || 0, off = n > 1 && t.inst_first === 'month' ? 1 : 0;
+  const each = round2(Math.floor(tot / n * 100) / 100), out = [];
+  for (let i = 1; i <= n; i++) out.push({ i, n, date: addMonthsIso(t.date, i - 1 + off), amount: i === n ? round2(tot - each * (n - 1)) : each });
+  return out;
+}
+// Allinea i prelievi (giroconti dalla fonte a PayPal) ai pagamenti: crea quelli arrivati, aggiorna quelli cambiati, toglie quelli senza pagamento
+function paypalSync(d) {
+  const today = todayIso(), rows = [], want = new Set();
+  for (const t of live(d.transactions)) {
+    if (t.kind !== 'expense' || !isPaypal(d.accounts[t.account_id]) || !t.fund_account_id || !d.accounts[t.fund_account_id] || d.accounts[t.fund_account_id].deleted) continue;
+    for (const r of ppPlan(t)) {
+      const id = `pp:${t.id}:${r.i}`; want.add(id);
+      if (r.date > today) continue;
+      const cur = d.transactions[id];
+      const row = { id, date: r.date, kind: 'transfer', amount: r.amount, account_id: t.fund_account_id, to_account_id: t.account_id, category_id: null, note: (r.n > 1 ? `Rata ${r.i}/${r.n}` : 'Pagamento PayPal') + (t.note ? ', ' + t.note : ''), deleted: false };
+      if (!cur) rows.push(row);
+      else if (cur.deleted || (cur.date !== row.date || Number(cur.amount) !== row.amount || cur.account_id !== row.account_id || cur.to_account_id !== row.to_account_id || cur.note !== row.note)) rows.push({ ...cur, ...row });
+    }
+  }
+  for (const t of live(d.transactions)) if (isPpRow(t) && !want.has(t.id)) rows.push({ ...t, deleted: true });
+  return rows;
+}
+// Rate future ancora da prelevare
+function upcomingRates(d, accId) {
+  const today = todayIso(), out = [];
+  for (const t of live(d.transactions)) {
+    if (t.kind !== 'expense' || !isPaypal(d.accounts[t.account_id]) || !t.fund_account_id || (accId && t.account_id !== accId && t.fund_account_id !== accId)) continue;
+    for (const r of ppPlan(t)) if (r.date > today) out.push({ ...r, t });
+  }
+  return out.sort((a, b) => a.date.localeCompare(b.date));
 }
 
 // ---------- ricorrenti ----------
@@ -332,6 +411,10 @@ function createStore(uid) {
       for (const date of occurrences(r, today)) { const id = occKey(r, date); if (!data.transactions[id]) rows.push(txFromRec(r, date, id)); }
     }
     if (rows.length) upsertMany('transactions', rows);
+    const pp = paypalSync(data);
+    if (pp.length) upsertMany('transactions', pp);
+    const cc = dueCardCharges(data);
+    if (cc.length) upsertMany('transactions', cc);
   }
 
   function exportObj() {
@@ -509,10 +592,12 @@ function CategoryPicker({ store, kind, value, onPick }) {
     <div class="chips" style="margin-top:10px"><button type="button" class="chip add" onClick=${addNew}>+ Nuova voce</button></div></div>`;
 }
 
-function AccountSelect({ store, value, onChange, exclude, label = 'Conto' }) {
-  const accs = live(store.data.accounts).filter(a => (!a.archived || a.id === value) && a.id !== exclude).sort(bySort);
+function AccountSelect({ store, value, onChange, exclude, label = 'Conto', noCards }) {
+  const accs = live(store.data.accounts).filter(a => (!a.archived || a.id === value) && a.id !== exclude && !(noCards && isCard(a))).sort(bySort);
+  const opt = a => html`<option value=${a.id}>${(a.icon ? a.icon + ' ' : '') + a.name}</option>`;
+  const banks = accs.filter(a => !isCard(a) && !isPaypal(a)), cards = accs.filter(isCard), pps = noCards ? [] : accs.filter(isPaypal);
   return html`<label class="f"><span>${label}</span><select class="i" value=${value} onChange=${e => onChange(e.target.value)}>
-    <option value="" disabled>Scegli un conto</option>${accs.map(a => html`<option value=${a.id}>${(a.icon ? a.icon + ' ' : '') + a.name}</option>`)}</select></label>`;
+    <option value="" disabled>Scegli un conto</option>${cards.length || pps.length ? html`<optgroup label="Conti">${banks.map(opt)}</optgroup>${cards.length ? html`<optgroup label="Carte di credito">${cards.map(opt)}</optgroup>` : null}${pps.length ? html`<optgroup label="PayPal">${pps.map(opt)}</optgroup>` : null}` : banks.map(opt)}</select></label>`;
 }
 
 function KindSeg({ kind, setKind }) {
@@ -537,6 +622,11 @@ function TxForm({ store, tx, onClose }) {
   const [err, setErr] = useState('');
   const [taxPart, setTaxPart] = useState(tx.tax_part || 'acconto');
   const [taxYear, setTaxYear] = useState(tx.tax_year ? String(tx.tax_year) : '');
+  const [fund, setFund] = useState(tx.id ? (tx.fund_account_id || '') : null);
+  const [rate, setRate] = useState((Number(tx.inst_n) || 1) > 1), [nRate, setNRate] = useState(String(Number(tx.inst_n) > 1 ? tx.inst_n : 3)), [first, setFirst] = useState(tx.inst_first || 'now');
+  const ppAcc = kind === 'expense' && isPaypal(d.accounts[acc]);
+  const fundV = fund === null ? (d.accounts[acc]?.charge_account_id || '') : fund;
+  const setN = v => { setNRate(v); setFirst(Number(v) === 3 ? 'now' : 'month'); };
   useEffect(() => { const c = d.categories[cat]; if (c && c.kind !== kind) setCat(''); }, [kind]);
   const isTaxCat = kind === 'expense' && d.categories[cat]?.scope === 'tax';
   const defYear = p => String(Number((date || todayIso()).slice(0, 4)) - (p === 'saldo' ? 1 : 0));
@@ -549,15 +639,21 @@ function TxForm({ store, tx, onClose }) {
     if (kind === 'transfer' && (!toAcc || toAcc === acc)) return setErr('Scegli un conto di destinazione diverso da quello di partenza.');
     if (kind !== 'transfer' && !cat && !isAdj(tx)) return setErr('Scegli una voce.');
     if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return setErr('Inserisci una data valida.');
+    if (ppAcc && fundV && rate && !(Number(nRate) >= 2 && Number(nRate) <= 60)) return setErr('Il numero di rate va da 2 a 60.');
     const isPos = kind === 'income' && pos;
-    store.upsert('transactions', { ...tx, id: tx.id || uuid(), date, kind, amount: round2(a), account_id: acc, to_account_id: kind === 'transfer' ? toAcc : null, category_id: kind === 'transfer' ? null : cat, note: note.trim() || null, invoiced: kind === 'income' && invoiced, pos: isPos, pos_pct: isPos ? pct : null, pos_fixed: isPos ? fix : null, pos_fee: isPos ? fee : null, tax_part: isTaxCat ? taxPart : null, tax_year: isTaxCat ? (Number(taxYear) || Number(defYear(taxPart))) : null, deleted: false });
+    store.upsert('transactions', { ...tx, id: tx.id || uuid(), date, kind, amount: round2(a), account_id: acc, to_account_id: kind === 'transfer' ? toAcc : null, category_id: kind === 'transfer' ? null : cat, note: note.trim() || null, invoiced: kind === 'income' && invoiced, pos: isPos, pos_pct: isPos ? pct : null, pos_fixed: isPos ? fix : null, pos_fee: isPos ? fee : null, tax_part: isTaxCat ? taxPart : null, tax_year: isTaxCat ? (Number(taxYear) || Number(defYear(taxPart))) : null, deleted: false,
+      fund_account_id: ppAcc ? (fundV || null) : null, inst_n: ppAcc && fundV && rate ? Number(nRate) : null, inst_first: ppAcc && fundV && rate ? first : null });
+    if (ppAcc || tx.fund_account_id) store.applyRecurring();
     const patch = {}; if (s.last_account !== acc) patch.last_account = acc; if (kind === 'income' && s.default_invoiced !== invoiced) patch.default_invoiced = invoiced;
     if (Object.keys(patch).length) store.setSettings(patch);
     onClose();
   };
-  const del = () => { if (confirm('Spostare questo movimento nel cestino? Potrai ripristinarlo dalle impostazioni.')) { store.upsert('transactions', { ...tx, deleted: true }); onClose(); } };
+  const del = () => { if (confirm('Spostare questo movimento nel cestino? Potrai ripristinarlo dalle impostazioni.')) { store.upsert('transactions', { ...tx, deleted: true }); if (tx.fund_account_id) store.applyRecurring(); onClose(); } };
+  const plan = ppAcc && fundV && a > 0 && /^\d{4}-\d{2}-\d{2}$/.test(date) ? ppPlan({ amount: a, date, inst_n: rate ? Number(nRate) || 1 : 1, inst_first: first }) : [];
+  const ppDerived = isPpRow(tx) && !tx.deleted;
 
   return html`<${Sheet} title=${isNew ? 'Nuovo movimento' : 'Modifica movimento'} onClose=${onClose}>
+    ${ppDerived && html`<p class="hint">Questo prelievo è creato in automatico dal pagamento PayPal: per cambiarlo modifica il pagamento. Se lo modifichi qui, alla prossima apertura verrà riallineato.</p>`}
     <div style="margin-top:10px"><${KindSeg} kind=${kind} setKind=${setKind} /></div>
     <${AmountField} big value=${amount} onInput=${setAmount} label=${kind === 'income' && pos ? 'Importo pagato dal cliente' : 'Importo'} />
     ${kind === 'income' && html`<label class="check"><input type="checkbox" checked=${pos} onChange=${e => setPos(e.target.checked)} />Incassato con POS</label>
@@ -565,7 +661,14 @@ function TxForm({ store, tx, onClose }) {
         <div class="calc num">Commissione ${eur(fee)}, accreditato sul conto ${eur(a > 0 ? a - fee : 0)}</div>
         ${!s.pos_pct && html`<p class="hint">Puoi salvare la tua commissione abituale nelle impostazioni, così la trovi già compilata.</p>`}`}`}
     <div class="two"><label class="f"><span>Data</span><input class="i" type="date" value=${date} onInput=${e => setDate(e.target.value)} /></label>
-      <${AccountSelect} store=${store} value=${acc} onChange=${setAcc} label=${kind === 'transfer' ? 'Da conto' : 'Conto'} /></div>
+      <${AccountSelect} store=${store} value=${acc} onChange=${setAcc} label=${kind === 'transfer' ? 'Da conto' : live(d.accounts).some(isCard) ? 'Conto o carta' : 'Conto'} /></div>
+    ${ppAcc && html`<label class="f"><span>Pagato con</span><select class="i" value=${fundV} onChange=${e => setFund(e.target.value)}><option value="">Saldo PayPal</option>
+        ${live(d.accounts).filter(x => !x.archived && !isPaypal(x) || x.id === fundV).sort(bySort).map(x => html`<option value=${x.id}>${(x.icon ? x.icon + ' ' : '') + x.name}</option>`)}</select></label>
+      ${fundV && html`<label class="check"><input type="checkbox" checked=${rate} onChange=${e => setRate(e.target.checked)} />Pagato a rate</label>`}
+      ${fundV && rate && html`<div class="two"><label class="f"><span>Numero di rate</span><input class="i num" inputmode="numeric" value=${nRate} onInput=${e => setN(e.target.value)} /></label>
+        <label class="f"><span>Prima rata</span><select class="i" value=${first} onChange=${e => setFirst(e.target.value)}><option value="now">Il giorno dell’acquisto</option><option value="month">Dopo un mese</option></select></label></div>
+        <p class="hint">Se il piano ha interessi, scrivi come importo il totale che pagherai con tutte le rate. Le date sono calcolate un mese dopo l’altra: se nel piano PayPal risultano diverse, sposta la data dell’acquisto.</p>`}
+      ${plan.length > 0 && html`<div class="calc num">${plan.length > 1 ? plan.map(r => html`<div>Rata ${r.i}/${r.n}: ${eur(r.amount)} il ${shortDate(r.date)}</div>`) : `Prelevati ${eur(plan[0].amount)} da ${d.accounts[fundV]?.name || ''} il ${shortDate(plan[0].date)}`}</div>`}`}
     ${kind === 'transfer' ? html`<${AccountSelect} store=${store} value=${toAcc} onChange=${setToAcc} exclude=${acc} label="A conto" />`
       : html`<div class="f" style="margin-top:14px"><span style="font-size:.82rem;color:var(--muted);font-weight:600">Voce</span><${CategoryPicker} store=${store} kind=${kind} value=${cat} onPick=${setCat} /></div>`}
     ${kind === 'income' && html`<label class="check"><input type="checkbox" checked=${invoiced} onChange=${e => setInvoiced(e.target.checked)} />Con fattura</label>`}
@@ -582,13 +685,13 @@ function TxForm({ store, tx, onClose }) {
 // ---------- riga movimento ----------
 function TxRow({ store, t, onOpen }) {
   const d = store.data, c = d.categories[t.category_id], a = d.accounts[t.account_id], to = d.accounts[t.to_account_id];
-  const title = isAdj(t) ? 'Rettifica saldo' : t.kind === 'transfer' ? 'Giroconto' : (c?.name || 'Senza voce');
+  const title = isAdj(t) ? 'Rettifica saldo' : isPpRow(t) ? (t.note && t.note.startsWith('Rata') ? 'Rata ' + (to?.name || 'PayPal') : 'Prelievo ' + (to?.name || 'PayPal')) : String(t.id).startsWith('cc:') ? 'Addebito ' + (to?.name || 'carta') : t.kind === 'transfer' ? 'Giroconto' : (c?.name || 'Senza voce');
   const sub = t.kind === 'transfer' ? `${a?.name || '?'} → ${to?.name || '?'}` : [a?.name, t.note].filter(Boolean).join(', ');
   const cls = t.kind === 'income' ? 'in' : t.kind === 'transfer' ? 'mut' : (c?.scope === 'tax' ? 'tx' : 'out');
   const sign = t.kind === 'income' ? '+' : t.kind === 'expense' ? '−' : '';
   return html`<button class="row" onClick=${() => onOpen(t)}>
     <i class="dot" style=${'--c:' + (t.kind === 'transfer' ? 'var(--muted)' : (c?.color || '#999'))}></i>
-    <div class="mid"><div class="t">${title}${t.pos ? html`<span class="tag">POS</span>` : null}${t.recurring_id ? html`<span class="tag">ricorrente</span>` : null}</div><div class="s">${sub || ' '}</div></div>
+    <div class="mid"><div class="t">${title}${t.pos ? html`<span class="tag">POS</span>` : null}${t.recurring_id ? html`<span class="tag">ricorrente</span>` : null}${String(t.id).startsWith('cc:') ? html`<span class="tag">addebito carta</span>` : null}${Number(t.inst_n) > 1 ? html`<span class="tag">${t.inst_n} rate</span>` : null}</div><div class="s">${sub || ' '}</div></div>
     <div class="amt num"><div class=${cls}>${sign}${eur(t.amount)}</div>${t.pos && t.pos_fee ? html`<div class="s num">comm. ${eur(t.pos_fee)}</div>` : null}</div>
   </button>`;
 }
@@ -617,7 +720,10 @@ function Movements({ store, openTx, goTab, init }) {
   return html`<div>
     <div class="worth"><div class="lbl">Patrimonio totale</div><div class="big num">${eur(total)}</div></div>
     <div class="accts">${accs.map(a => html`<button class=${'acct' + (fAcc === a.id ? ' on' : '')} style=${'--c:' + (a.color || '#888')} onClick=${() => setFAcc(fAcc === a.id ? '' : a.id)} aria-pressed=${fAcc === a.id}>
-      <div class="n">${(a.icon ? a.icon + ' ' : '') + a.name}</div><div class="v num">${eur(bal[a.id])}</div></button>`)}</div>
+      <div class="n">${(a.icon ? a.icon + ' ' : '') + a.name}</div>${isCard(a) ? html`<div class="v num">${eur(Math.max(0, -(bal[a.id] || 0)))}</div><div class="n" style="font-size:.75rem">da addebitare</div>`
+        : isPaypal(a) && (bal[a.id] || 0) < -0.004 ? html`<div class="v num">${eur(-bal[a.id])}</div><div class="n" style="font-size:.75rem">rate da pagare</div>` : html`<div class="v num">${eur(bal[a.id])}</div>`}</button>`)}</div>
+    ${isCard(d.accounts[fAcc]) && html`<${CardSummary} store=${store} card=${d.accounts[fAcc]} />`}
+    ${isPaypal(d.accounts[fAcc]) && html`<${RatesSummary} store=${store} accId=${fAcc} />`}
     ${reminders.length > 0 && html`<button class="banner" onClick=${() => goTab('rec')}><span>${reminders.length === 1 ? '1 pagamento da registrare' : reminders.length + ' pagamenti da registrare'}</span><span>›</span></button>`}
     <div class="month"><button class="iconbtn" aria-label="Indietro" onClick=${() => setYm(addMonths(ym, mode === 'month' ? -1 : -12))}>‹</button><h2>${periodLabel}</h2><button class="iconbtn" aria-label="Avanti" onClick=${() => setYm(addMonths(ym, mode === 'month' ? 1 : 12))}>›</button></div>
     <div class="totals num"><div><small>Entrate</small><b class="in">${eur(inc)}</b></div><div><small>Uscite</small><b class="out">${eur(exp)}</b></div><div><small>Differenza</small><b>${eur(inc - exp)}</b></div></div>
@@ -626,6 +732,31 @@ function Movements({ store, openTx, goTab, init }) {
     ${mode === 'year' && html`<p class="hint">Stai vedendo tutto l’anno ${year}. <button class="linkbtn" onClick=${() => setMode('month')}>Mostra solo il mese</button></p>`}
     ${days.length === 0 ? html`<div class="empty" style="margin-top:12px">Nessun movimento in ${periodLabel}.<br/>Tocca “+ Movimento” per aggiungerne uno.</div>`
       : days.map(g => html`<div class="day">${dayLabel(g.date)}</div><div class="list">${g.items.map(t => html`<${TxRow} key=${t.id} store=${store} t=${t} onOpen=${openTx} />`)}</div>`)}
+  </div>`;
+}
+
+// ---------- riepilogo carta di credito ----------
+function CardSummary({ store, card }) {
+  const d = store.data, s = cardStatus(d, card), from = d.accounts[card.charge_account_id];
+  return html`<div class="card" style="margin-top:10px">
+    <div class="mut" style="font-size:.85rem">Prossimo addebito, ${dayLabel(s.next.charge)}${from ? ' su ' + from.name : ''}</div>
+    <div class="num" style="font-size:1.5rem;font-weight:800">${eur(s.nextAmt)}</div>
+    <div class="hint" style="margin-top:2px">Spese fino al ${shortDate(s.next.close)}</div>
+    ${s.afterAmt > 0.004 && html`<div class="calc num">Già spesi ${eur(s.afterAmt)} che andranno nell’addebito del ${shortDate(s.after.charge)}</div>`}
+    ${(() => { const up = upcomingRates(d, card.id).filter(r => r.t.fund_account_id === card.id), v = up.reduce((x, r) => x + r.amount, 0); return up.length ? html`<div class="calc num">Rate PayPal future su questa carta: ${eur(v)} (${up.length} ${up.length === 1 ? 'rata' : 'rate'})</div>` : null; })()}
+    ${s.avail !== null && html`<div class="calc num">Disponibile ${eur(s.avail)} su un plafond di ${eur(s.limit)}</div>`}
+    ${!from && html`<div class="err">Scegli in Impostazioni → Conti il conto su cui viene addebitata questa carta.</div>`}
+  </div>`;
+}
+
+// ---------- rate in corso ----------
+function RatesSummary({ store, accId }) {
+  const d = store.data, up = upcomingRates(d, accId), tot = up.reduce((x, r) => x + r.amount, 0);
+  if (!up.length) return html`<div class="card" style="margin-top:10px"><div class="mut" style="font-size:.85rem">Nessuna rata da pagare</div></div>`;
+  return html`<div class="card" style="margin-top:10px">
+    <div class="mut" style="font-size:.85rem">Rate ancora da pagare</div><div class="num" style="font-size:1.5rem;font-weight:800">${eur(tot)}</div>
+    <div class="list" style="margin-top:8px">${up.slice(0, 12).map(r => html`<div class="row" style="cursor:default"><div class="mid"><div class="t">${shortDate(r.date)}, rata ${r.i}/${r.n}</div><div class="s">${[d.categories[r.t.category_id]?.name, r.t.note, 'da ' + (d.accounts[r.t.fund_account_id]?.name || '?')].filter(Boolean).join(', ')}</div></div><div class="amt num">${eur(r.amount)}</div></div>`)}</div>
+    ${up.length > 12 && html`<p class="hint">e altre ${up.length - 12} rate.</p>`}
   </div>`;
 }
 
@@ -761,10 +892,11 @@ function AccountsEditor({ store, onClose }) {
   const accs = live(d.accounts).sort(bySort);
   if (edit) return html`<${AccountForm} store=${store} acc=${edit} onDone=${() => setEdit(null)} onClose=${onClose} />`;
   return html`<${Sheet} title="Conti" onClose=${onClose}>
-    <p class="hint">Tocca un conto per rinominarlo, cambiare colore o saldo iniziale.</p>
-    <div class="list" style="margin-top:10px">${accs.map(a => html`<button class="row" onClick=${() => setEdit(a)}><i class="dot" style=${'--c:' + (a.color || '#888')}></i>
-      <div class="mid"><div class="t">${(a.icon ? a.icon + ' ' : '') + a.name}${a.archived ? html`<span class="tag">archiviato</span>` : null}</div></div><div class="amt num">${eur(bal[a.id])}</div></button>`)}</div>
-    <button class="btn" onClick=${() => setEdit({})}>+ Nuovo conto</button>
+    <p class="hint">Tocca un conto o una carta per modificarli.</p>
+    ${[['bank', 'Conti'], ['card', 'Carte di credito'], ['paypal', 'PayPal']].map(([k, l]) => { const c = k === 'card', g = accs.filter(a => (a.type === 'card' || a.type === 'paypal' ? a.type : 'bank') === k); return g.length ? html`<div class="grp">${l}</div><div class="list">${g.map(a => html`<button class="row" onClick=${() => setEdit(a)}><i class="dot" style=${'--c:' + (a.color || '#888')}></i>
+      <div class="mid"><div class="t">${(a.icon ? a.icon + ' ' : '') + a.name}${a.archived ? html`<span class="tag">archiviato</span>` : null}</div>${c && html`<div class="s">Addebito il ${a.charge_day || 15} del mese${d.accounts[a.charge_account_id] ? ' su ' + d.accounts[a.charge_account_id].name : ''}</div>`}</div><div class="amt num">${c ? html`<div class="out">${eur(Math.max(0, -(bal[a.id] || 0)))}</div><div class="s">da addebitare</div>` : eur(bal[a.id])}</div></button>`)}</div>` : null; })}
+    <div class="two"><button class="btn" onClick=${() => setEdit({})}>+ Nuovo conto</button><button class="btn sec2" onClick=${() => setEdit({ type: 'card', icon: '💳' })}>+ Nuova carta</button></div>
+    ${!accs.some(isPaypal) && html`<button class="btn sec2" onClick=${() => setEdit({ type: 'paypal', icon: '🅿️', name: 'PayPal' })}>+ PayPal</button>`}
   <//>`;
 }
 function AccountForm({ store, acc, onDone, onClose }) {
@@ -779,28 +911,52 @@ function AccountForm({ store, acc, onDone, onClose }) {
   };
   const isNew = !acc.id, used = !isNew && live(store.data.transactions).some(t => t.account_id === acc.id || t.to_account_id === acc.id);
   const [name, setName] = useState(acc.name || ''), [icon, setIcon] = useState(acc.icon ?? '🏦'), [color, setColor] = useState(acc.color || COLORS[live(store.data.accounts).length % COLORS.length]);
-  const [init, setInit] = useState(fmtIn(acc.initial_balance ?? '')), [archived, setArchived] = useState(!!acc.archived), [err, setErr] = useState('');
+  const [type, setType] = useState(acc.type || 'bank'), card = type === 'card';
+  const [init, setInit] = useState(fmtIn(card && acc.initial_balance ? -acc.initial_balance : (acc.initial_balance ?? ''))), [archived, setArchived] = useState(!!acc.archived), [err, setErr] = useState('');
+  const [chargeDay, setChargeDay] = useState(String(acc.charge_day || 15)), [closeDay, setCloseDay] = useState(acc.close_day ? String(acc.close_day) : '');
+  const [chargeAcc, setChargeAcc] = useState(acc.charge_account_id || live(store.data.accounts).filter(a => !a.archived && !isCard(a) && !isPaypal(a) && a.id !== acc.id).sort(bySort)[0]?.id || ''), [limit, setLimit] = useState(fmtIn(acc.card_limit ?? ''));
+  const pp = type === 'paypal';
+  const setKindT = k => { setType(k); const def = { bank: '🏦', card: '💳', paypal: '🅿️' }; if (!icon || Object.values(def).includes(icon)) setIcon(def[k]); if (k === 'paypal' && !name.trim()) setName('PayPal'); };
   const save = () => {
-    if (!name.trim()) return setErr('Dai un nome al conto.');
-    const ib = init.trim() === '' ? 0 : parseAmt(init); if (Number.isNaN(ib)) return setErr('Saldo iniziale non valido.');
-    store.upsert('accounts', { ...acc, id: acc.id || uuid(), name: name.trim(), icon: icon.trim() || null, color, initial_balance: round2(ib), archived, sort: acc.sort ?? live(store.data.accounts).length, deleted: false }); onDone();
+    if (!name.trim()) return setErr(card ? 'Dai un nome alla carta.' : 'Dai un nome al conto.');
+    const ib = init.trim() === '' ? 0 : parseAmt(init); if (Number.isNaN(ib)) return setErr(card ? 'Importo delle spese non valido.' : 'Saldo iniziale non valido.');
+    const cd = Number(chargeDay), cl = closeDay.trim() === '' ? null : Number(closeDay), lim = limit.trim() === '' ? null : parseAmt(limit);
+    if (card && !(cd >= 1 && cd <= 31)) return setErr('Il giorno di addebito va da 1 a 31.');
+    if (card && cl !== null && !(cl >= 1 && cl <= 31)) return setErr('Il giorno di chiusura va da 1 a 31, oppure lascialo vuoto per fine mese.');
+    if (card && !chargeAcc) return setErr('Scegli il conto su cui viene addebitata la carta.');
+    if (card && lim !== null && Number.isNaN(lim)) return setErr('Plafond non valido.');
+    store.upsert('accounts', { ...acc, id: acc.id || uuid(), name: name.trim(), icon: icon.trim() || null, color, initial_balance: round2(card ? -Math.abs(ib) : ib), archived, sort: acc.sort ?? live(store.data.accounts).length, deleted: false,
+      type, charge_day: card ? cd : null, close_day: card ? cl : null, charge_account_id: card || pp ? (chargeAcc || null) : null, card_limit: card ? lim : null, card_since: card ? (acc.card_since || todayIso()) : null });
+    if (card || pp) store.applyRecurring();
+    onDone();
   };
   const del = () => { if (confirm('Eliminare questo conto?')) { store.upsert('accounts', { ...acc, deleted: true }); onDone(); } };
-  return html`<${Sheet} title=${isNew ? 'Nuovo conto' : 'Modifica conto'} onClose=${onClose}>
+  return html`<${Sheet} title=${isNew ? (card ? 'Nuova carta' : 'Nuovo conto') : (card ? 'Modifica carta' : 'Modifica conto')} onClose=${onClose}>
     <button class="linkbtn" onClick=${onDone}>‹ Tutti i conti</button>
+    <div class="seg" style="margin-top:10px">${[['bank', 'Conto'], ['card', 'Carta di credito'], ['paypal', 'PayPal']].map(([k, l]) => html`<button type="button" class=${type === k ? 'on' : ''} onClick=${() => setKindT(k)}>${l}</button>`)}</div>
     <div class="two" style="grid-template-columns:80px 1fr"><label class="f"><span>Icona</span><input class="i" value=${icon} onInput=${e => setIcon(e.target.value)} maxlength="4" style="text-align:center" /></label>
       <label class="f"><span>Nome</span><input class="i" value=${name} onInput=${e => setName(e.target.value)} placeholder="Es. Banca, Carta prepagata" /></label></div>
-    ${!isNew && html`<div class="card" style="margin-top:14px"><div class="mut" style="font-size:.85rem">Saldo attuale in app</div><div class="num" style="font-size:1.5rem;font-weight:800">${eur(curBal)}</div>
+    ${card && html`<div class="two"><label class="f"><span>Giorno di addebito</span><input class="i num" inputmode="numeric" value=${chargeDay} onInput=${e => setChargeDay(e.target.value)} /></label>
+      <label class="f"><span>Chiusura estratto conto</span><input class="i num" inputmode="numeric" placeholder="fine mese" value=${closeDay} onInput=${e => setCloseDay(e.target.value)} /></label></div>
+      <p class="hint">Ogni mese, nel giorno di addebito, l’app registra da sola un giroconto dal conto scelto qui sotto alla carta, per il totale delle spese fatte fino alla chiusura del mese precedente. Le spese restano nei grafici con la loro data e la loro voce; l’addebito non conta come uscita, così non si contano due volte.</p>
+      <${AccountSelect} store=${store} value=${chargeAcc} onChange=${setChargeAcc} exclude=${acc.id} label="Addebitata sul conto" noCards />
+      <${AmountField} label="Plafond (facoltativo)" value=${limit} onInput=${setLimit} />`}
+    ${pp && html`<label class="f"><span>Metodo di pagamento abituale</span><select class="i" value=${chargeAcc} onChange=${e => setChargeAcc(e.target.value)}><option value="">Saldo PayPal</option>
+        ${live(store.data.accounts).filter(x => !x.archived && !isPaypal(x) && x.id !== acc.id).sort(bySort).map(x => html`<option value=${x.id}>${(x.icon ? x.icon + ' ' : '') + x.name}</option>`)}</select></label>
+      <p class="hint">Viene proposto quando registri un pagamento con PayPal, e puoi cambiarlo ogni volta. L’app preleva l’importo da lì (anche a rate), così la spesa conta una volta sola e il conto o la carta scendono quando vengono davvero addebitati.</p>`}
+    ${!isNew && !card && html`<div class="card" style="margin-top:14px"><div class="mut" style="font-size:.85rem">Saldo attuale in app</div><div class="num" style="font-size:1.5rem;font-weight:800">${eur(curBal)}</div>
       <${AmountField} label="Saldo reale (quello che vedi in banca)" value=${real} onInput=${setReal} />
       <button class="btn sec2" onClick=${adjust}>Correggi saldo</button>
       <p class="hint">Aggiunge un movimento “Rettifica saldo” con la differenza. Non conta nelle entrate, nelle uscite e nei grafici, e se serve puoi eliminarlo dai movimenti.</p>
       ${adjMsg && html`<div class="okmsg">${adjMsg}</div>`}</div>`}
-    <${AmountField} label="Saldo iniziale" value=${init} onInput=${setInit} />
-    <p class="hint">${isNew ? 'Quanto c’è sul conto adesso, prima di registrare movimenti.' : 'Il saldo di partenza, prima di tutti i movimenti registrati. Per allineare il conto alla banca usa “Correggi saldo” qui sopra.'}</p>
+    ${card ? html`<${AmountField} label="Spese già fatte e non ancora addebitate" value=${init} onInput=${setInit} />
+      <p class="hint">${isNew ? 'Se hai già usato la carta prima di registrarla qui, scrivi il totale che ti verrà addebitato. Le spese da ora in poi registrale come movimenti scegliendo questa carta.' : 'Il debito di partenza, prima di tutti i movimenti registrati.'}</p>`
+    : html`<${AmountField} label="Saldo iniziale" value=${init} onInput=${setInit} />
+    <p class="hint">${isNew ? 'Quanto c’è sul conto adesso, prima di registrare movimenti.' : 'Il saldo di partenza, prima di tutti i movimenti registrati. Per allineare il conto alla banca usa “Correggi saldo” qui sopra.'}</p>`}
     <label class="f"><span>Colore</span><div class="swatches">${COLORS.map(c => html`<button type="button" class=${'sw' + (c === color ? ' on' : '')} style=${'--c:' + c} aria-label=${'Colore ' + c} onClick=${() => setColor(c)}></button>`)}</div></label>
     ${!isNew && html`<label class="check"><input type="checkbox" checked=${archived} onChange=${e => setArchived(e.target.checked)} />Archiviato (non compare più nelle scelte)</label>`}
     ${err && html`<div class="err" role="alert">${err}</div>`}
-    <button class="btn" onClick=${save}>Salva conto</button>
+    <button class="btn" onClick=${save}>${card ? 'Salva carta' : 'Salva conto'}</button>
     ${!isNew && (used ? html`<p class="hint">Questo conto ha dei movimenti: per nasconderlo usa “Archiviato”.</p>` : html`<button class="btn danger" onClick=${del}>Elimina conto</button>`)}
   <//>`;
 }
@@ -1068,7 +1224,7 @@ function registerDeadline(store, dl) {
   if (amt === null) return;
   const a = parseAmt(amt); if (!(a > 0)) return alert('Importo non valido.');
   const d = store.data, s = d.settings, today = todayIso();
-  const acc = (d.accounts[s.last_account] && !d.accounts[s.last_account].deleted && s.last_account) || live(d.accounts).filter(x => !x.archived).sort(bySort)[0]?.id;
+  const acc = (d.accounts[s.last_account] && !d.accounts[s.last_account].deleted && !isCard(d.accounts[s.last_account]) && !isPaypal(d.accounts[s.last_account]) && s.last_account) || live(d.accounts).filter(x => !x.archived && !isCard(x) && !isPaypal(x)).sort(bySort)[0]?.id;
   store.upsert('transactions', { id: dl.id, date: today < dl.date ? today : dl.date, kind: 'expense', amount: round2(a), account_id: acc, category_id: taxCatFor(store, dl.role), note: dl.label, tax_part: dl.part, tax_year: dl.year, deleted: false });
 }
 function skipDeadline(store, dl) {
