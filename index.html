@@ -1407,7 +1407,7 @@ function Settings({ store, user, open }) {
   const nAcc = live(store.data.accounts).length, nCat = live(store.data.categories).length;
   return html`<div>
     <div class="sec">Personalizza</div>
-    <div><button class="setrow" onClick=${() => open('accounts')}><span>Conti</span><small>${nAcc} ›</small></button><button class="setrow" onClick=${() => open('categories')}><span>Voci di entrata e uscita</span><small>${nCat} ›</small></button><button class="setrow" onClick=${() => open('taxprofile')}><span>Profilo fiscale</span><small>›</small></button></div>
+    <div><button class="setrow" onClick=${() => open('accounts')}><span>Conti</span><small>${nAcc} ›</small></button><button class="setrow" onClick=${() => open('categories')}><span>Voci di entrata e uscita</span><small>${nCat} ›</small></button><button class="setrow" onClick=${() => open('taxprofile')}><span>Profilo fiscale</span><small>›</small></button><button class="setrow" onClick=${() => { store.setSettings({ guide: 'show' }); window.scrollTo(0, 0); }}><span>Guida iniziale</span><small>rivedi ›</small></button></div>
     <div class="sec">Pagamenti con POS</div>
     <div class="card"><p class="hint" style="margin-top:0">Le condizioni del tuo contratto POS. Vengono proposte in automatico quando segni un incasso con POS.</p>
       <div class="two"><${AmountField} label="Commissione %" value=${pct} onInput=${setPct} /><${AmountField} label="Costo fisso (€)" value=${fix} onInput=${setFix} /></div>
@@ -1429,8 +1429,114 @@ function Welcome({ store }) {
   return html`<div class="center"><p class="brand">Benvenuto</p>
     <p>Per iniziare puoi recuperare i dati dalla versione precedente dell’app, oppure partire con conti e voci di base da personalizzare.</p>
     <label class="btn" style="text-align:center">Importa un backup<input type="file" accept="application/json,.json" style="display:none" onChange=${onImport} /></label>
-    <button class="btn sec2" onClick=${() => seedDefaults(store)}>Parti da zero</button>
+    <button class="btn sec2" onClick=${() => { seedDefaults(store); store.setSettings({ guide: 'show' }); }}>Parti da zero, con una guida veloce</button>
     ${err && html`<div class="err" role="alert">${err}</div>`}</div>`;
+}
+
+// ---------- guida iniziale (tutti i passi sono facoltativi) ----------
+function Guide({ store, onDone }) {
+  const d = store.data, s = d.settings, P = s.tax || {};
+  const [step, setStep] = useState(0), [err, setErr] = useState('');
+  const used = id => live(d.transactions).some(t => t.account_id === id || t.to_account_id === id);
+  const banksNow = () => live(store.data.accounts).filter(a => !a.archived && !isCard(a) && !isPaypal(a)).sort(bySort);
+  const [accs, setAccs] = useState(() => banksNow().map(a => ({ id: a.id, name: a.name, bal: used(a.id) ? null : fmtIn(a.initial_balance || '') })));
+  const [extra, setExtra] = useState([]);
+  const [card, setCard] = useState(false), [cName, setCName] = useState(''), [cDay, setCDay] = useState('15'), [cAcc, setCAcc] = useState('');
+  const hasPp = live(d.accounts).some(isPaypal), [pp, setPp] = useState(false), [ppFund, setPpFund] = useState(null);
+  const [regime, setRegime] = useState(P.regime || ''), [pct, setPct] = useState(fmtIn(s.pos_pct ?? '')), [fix, setFix] = useState(fmtIn(s.pos_fixed ?? ''));
+  const piva = regime === 'forfettario' || regime === 'ordinario';
+  const N = 3, go = n => { setErr(''); setStep(n); window.scrollTo(0, 0); };
+  const setA = (i, k, v) => setAccs(L => L.map((a, j) => j === i ? { ...a, [k]: v } : a));
+  const setE = (i, k, v) => setExtra(L => L.map((a, j) => j === i ? { ...a, [k]: v } : a));
+
+  const saveAccounts = () => {
+    const rows = [];
+    for (const a of accs) {
+      const cur = store.data.accounts[a.id]; if (!cur) continue;
+      const ib = a.bal === null ? cur.initial_balance : (String(a.bal).trim() === '' ? 0 : parseAmt(a.bal));
+      if (Number.isNaN(ib)) return setErr(`Il saldo di “${a.name || cur.name}” non è valido: scrivi per esempio 1.250,00`);
+      rows.push({ ...cur, name: a.name.trim() || cur.name, initial_balance: round2(ib) });
+    }
+    let n = live(store.data.accounts).length;
+    for (const a of extra) {
+      if (!a.name.trim()) continue;
+      const ib = String(a.bal).trim() === '' ? 0 : parseAmt(a.bal);
+      if (Number.isNaN(ib)) return setErr(`Il saldo di “${a.name}” non è valido.`);
+      rows.push({ id: uuid(), name: a.name.trim(), icon: '🏦', color: COLORS[n % COLORS.length], initial_balance: round2(ib), sort: n++, type: 'bank' });
+    }
+    if (rows.length) store.upsertMany('accounts', rows);
+    setExtra([]); go(2);
+  };
+  const cardAcc = cAcc || banksNow()[0]?.id || '';
+  const cardId = useMemo(() => uuid(), []);
+  const fundOpts = () => { const all = live(store.data.accounts).filter(a => !a.archived && !isPaypal(a)).sort(bySort); return card && cName.trim() ? [...all, { id: cardId, name: cName.trim(), icon: '💳' }] : all; };
+  const ppFundV = ppFund === null ? (card && cName.trim() ? cardId : banksNow()[0]?.id || '') : ppFund;
+  const savePay = () => {
+    const n = live(store.data.accounts).length, rows = [];
+    if (card && cName.trim()) {
+      const cd = Number(cDay); if (!(cd >= 1 && cd <= 31)) return setErr('Il giorno di addebito va da 1 a 31.');
+      if (!cardAcc) return setErr('Scegli il conto su cui viene addebitata la carta.');
+      rows.push({ id: cardId, name: cName.trim(), icon: '💳', color: COLORS[n % COLORS.length], initial_balance: 0, sort: n, type: 'card', charge_day: cd, charge_account_id: cardAcc, card_since: todayIso() });
+    }
+    if (pp && !hasPp) rows.push({ id: uuid(), name: 'PayPal', icon: '🅿️', color: COLORS[(n + 1) % COLORS.length], initial_balance: 0, sort: n + 1, type: 'paypal', charge_account_id: (ppFundV === cardId && !(card && cName.trim())) ? null : (ppFundV || null) });
+    if (rows.length) store.upsertMany('accounts', rows);
+    go(3);
+  };
+  const saveWork = () => {
+    const patch = {};
+    if (regime && regime !== P.regime) patch.tax = { ...P, regime };
+    if (piva) { const p = pct.trim() === '' ? null : parseAmt(pct), f = fix.trim() === '' ? null : parseAmt(fix); if (Number.isNaN(p) || Number.isNaN(f)) return setErr('Commissione POS non valida.'); if (p !== (s.pos_pct ?? null) || f !== (s.pos_fixed ?? null)) { patch.pos_pct = p; patch.pos_fixed = f; } }
+    if (Object.keys(patch).length) store.setSettings(patch);
+    go(4);
+  };
+
+  const head = html`<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px"><span class="mut" style="font-size:.85rem">${step > 0 && step <= N ? `Passo ${step} di ${N}` : ''}</span>${step <= N && html`<button class="linkbtn" onClick=${() => onDone()}>Salta la guida</button>`}</div>`;
+  const nav = (save, skip) => html`${err && html`<div class="err" role="alert">${err}</div>`}<button class="btn" onClick=${save}>Avanti</button><div style="display:flex;justify-content:space-between;margin-top:12px"><button class="linkbtn" onClick=${() => go(step - 1)}>‹ Indietro</button><button class="linkbtn" onClick=${() => go(skip)}>Salta questo passo</button></div>`;
+
+  return html`<div class="wrap">${head}
+    ${step === 0 && html`<div class="center" style="min-height:60vh;padding:0">
+      <p class="brand">Benvenuto</p>
+      <p>In tre passi veloci imposti le cose di base: i tuoi conti, le carte e come lavori. Niente è obbligatorio: puoi saltare qualsiasi passo e cambiare tutto dopo, dalle Impostazioni.</p>
+      <button class="btn" onClick=${() => go(1)}>Iniziamo</button></div>`}
+
+    ${step === 1 && html`<h2>I tuoi conti</h2>
+      <p class="hint">Scrivi quanto c’è adesso su ogni conto: da qui l’app terrà il saldo aggiornato con i movimenti che registri. Puoi rinominarli come vuoi, per esempio col nome della banca.</p>
+      ${accs.map((a, i) => html`<div class="card" style="margin-top:12px"><label class="f" style="margin-top:0"><span>Nome</span><input class="i" value=${a.name} onInput=${e => setA(i, 'name', e.target.value)} /></label>
+        ${a.bal === null ? html`<p class="hint">Questo conto ha già dei movimenti: il saldo si corregge da Impostazioni → Conti.</p>` : html`<${AmountField} label="Saldo attuale" value=${a.bal} onInput=${v => setA(i, 'bal', v)} />`}</div>`)}
+      ${extra.map((a, i) => html`<div class="card" style="margin-top:12px"><label class="f" style="margin-top:0"><span>Nome del nuovo conto</span><input class="i" value=${a.name} placeholder="Es. Fineco, Conto deposito" onInput=${e => setE(i, 'name', e.target.value)} /></label>
+        <${AmountField} label="Saldo attuale" value=${a.bal} onInput=${v => setE(i, 'bal', v)} /></div>`)}
+      <button class="btn sec2" onClick=${() => setExtra([...extra, { name: '', bal: '' }])}>+ Aggiungi un altro conto</button>
+      ${nav(saveAccounts, 2)}`}
+
+    ${step === 2 && html`<h2>Carte e PayPal</h2>
+      <p class="hint">Se paghi con una carta di credito, l’app registra la spesa quando la fai e scala il conto solo il giorno dell’addebito.</p>
+      ${live(d.accounts).filter(isCard).length > 0 && html`<p class="hint">Carte già inserite: ${live(d.accounts).filter(isCard).map(c => c.name).join(', ')}.</p>`}
+      <label class="check"><input type="checkbox" checked=${card} onChange=${e => setCard(e.target.checked)} />Ho una carta di credito</label>
+      ${card && html`<div class="card" style="margin-top:8px"><label class="f" style="margin-top:0"><span>Nome della carta</span><input class="i" value=${cName} placeholder="Es. Amex, Visa Fineco" onInput=${e => setCName(e.target.value)} /></label>
+        <div class="two"><label class="f"><span>Giorno di addebito</span><input class="i num" inputmode="numeric" value=${cDay} onInput=${e => setCDay(e.target.value)} /></label>
+        <${AccountSelect} store=${store} value=${cardAcc} onChange=${setCAcc} label="Addebitata sul conto" noCards /></div>
+        <p class="hint">Giorno di chiusura, plafond e spese già fatte li trovi poi in Impostazioni → Conti.</p></div>`}
+      ${!hasPp && html`<label class="check"><input type="checkbox" checked=${pp} onChange=${e => setPp(e.target.checked)} />Pago anche con PayPal</label>
+        ${pp && html`<label class="f"><span>Di solito PayPal preleva da</span><select class="i" value=${ppFundV} onChange=${e => setPpFund(e.target.value)}><option value="">Saldo PayPal</option>${fundOpts().map(x => html`<option value=${x.id}>${(x.icon ? x.icon + ' ' : '') + x.name}</option>`)}</select></label>
+          <p class="hint">Potrai cambiarlo per ogni pagamento, e segnare quelli a rate.</p>`}`}
+      ${nav(savePay, 3)}`}
+
+    ${step === 3 && html`<h2>Come lavori?</h2>
+      <p class="hint">Serve per la sezione Tasse, che stima quanto mettere da parte. Se preferisci, salta: la imposti quando vuoi.</p>
+      <div class="chips" style="margin-top:12px">${[['dipendente', 'Dipendente o pensionato'], ['forfettario', 'Partita IVA forfettaria'], ['ordinario', 'Partita IVA ordinaria']].map(([k, l]) => html`<button type="button" class=${'chip' + (regime === k ? ' on' : '')} onClick=${() => setRegime(regime === k ? '' : k)}>${l}</button>`)}</div>
+      ${piva && html`<div class="card" style="margin-top:14px"><b>Incassi con POS</b><p class="hint" style="margin-top:4px">Se incassi con POS, la commissione del tuo contratto: verrà proposta in automatico. Lascia vuoto se non lo usi.</p>
+        <div class="two"><${AmountField} label="Commissione %" value=${pct} onInput=${setPct} /><${AmountField} label="Costo fisso (€)" value=${fix} onInput=${setFix} /></div></div>`}
+      ${nav(saveWork, 4)}`}
+
+    ${step === 4 && html`<div class="center" style="min-height:60vh;padding:0">
+      <p class="brand">Fatto</p>
+      <p>Tre cose utili per cominciare:</p>
+      <p class="hint" style="font-size:.95rem">Con <b>+ Movimento</b> registri entrate, uscite e giroconti. Scegli la carta o PayPal come conto quando paghi con quelli.</p>
+      <p class="hint" style="font-size:.95rem">In <b>Ricorrenti</b> metti affitto, abbonamenti e stipendio: si registrano da soli ogni mese.</p>
+      <p class="hint" style="font-size:.95rem">Le voci di spesa sono già pronte, e le cambi in Impostazioni → Voci di entrata e uscita. Da Impostazioni puoi anche riaprire questa guida.</p>
+      ${piva ? html`<button class="btn" onClick=${() => onDone('taxprofile')}>Completa il profilo fiscale</button><button class="btn sec2" onClick=${() => onDone()}>Lo faccio dopo</button>`
+        : html`<button class="btn" onClick=${() => onDone()}>Inizia a usare l’app</button>`}</div>`}
+  </div>`;
 }
 
 // ---------- app principale ----------
@@ -1444,6 +1550,7 @@ function Main({ user }) {
   if (!hasAcc && !st.loaded) return html`<div class="center"><p class="brand">Finanze</p><p class="mut">${st.error || 'Caricamento dei tuoi dati…'}</p>${st.error && html`<button class="btn" onClick=${() => store.pull()}>Riprova</button>`}</div>`;
   if (!hasAcc) return html`<${Welcome} store=${store} />`;
   const close = () => setSheet(null);
+  if (d.settings.guide === 'show') return html`<${Guide} store=${store} onDone=${k => { store.setSettings({ guide: 'done' }); if (k === 'taxprofile') { setTab('tax'); setSheet({ k }); } window.scrollTo(0, 0); }} />`;
   const TABS = [['mov', '☰', 'Movimenti'], ['charts', '▤', 'Grafici'], ['tax', '%', 'Tasse'], ['rec', '↻', 'Ricorrenti'], ['set', '⚙', 'Impostazioni']];
   return html`<div class="wrap">
     <div class="top"><h1>${TABS.find(t => t[0] === tab)[2]}</h1><${SyncPill} store=${store} /></div>
