@@ -83,6 +83,17 @@ nav.tabs .in2{display:flex;max-width:560px;width:100%}
 nav.tabs button{flex:1;border:0;background:none;padding:10px 4px 12px;font-size:.78rem;color:var(--muted);cursor:pointer;display:flex;flex-direction:column;align-items:center;gap:2px}
 nav.tabs button span{font-size:1.25rem;line-height:1}
 nav.tabs button.on{color:var(--ink);font-weight:700}
+nav.tabs .in2.six button{font-size:.68rem;padding-left:2px;padding-right:2px;min-width:0}
+.who{display:grid;grid-template-columns:1fr 1fr;gap:1px;background:var(--line);border-radius:12px;overflow:hidden}
+.who div{background:var(--card);padding:12px 14px}
+.who small{display:block;color:var(--muted);font-size:.78rem}
+.who b{font-size:1.2rem}
+.split{display:flex;height:10px;border-radius:99px;overflow:hidden;background:var(--soft);margin:10px 0 4px}
+.split i{display:block;height:100%}
+.vtab{display:grid;grid-template-columns:1fr auto auto;gap:4px 14px;align-items:baseline;font-size:.92rem}
+.vtab .h{font-size:.76rem;color:var(--muted);font-weight:600}
+.vtab .r{text-align:right}
+.row.ro{cursor:default}
 .sec{margin:22px 0 8px;font-size:1rem;font-weight:700}
 .card{background:var(--card);border-radius:12px;padding:14px}
 .hint{color:var(--muted);font-size:.84rem;margin:6px 0 0}
@@ -224,8 +235,8 @@ const TABLES = ['accounts', 'categories', 'transactions', 'recurring'];
 const COLS = {
   accounts: { user_id: null, id: null, name: '', icon: null, color: null, initial_balance: 0, sort: 0, archived: false, deleted: false, type: 'bank', charge_day: null, close_day: null, charge_account_id: null, card_limit: null, card_since: null },
   categories: { user_id: null, id: null, name: '', kind: 'expense', scope: 'personal', color: null, sort: 0, archived: false, deleted: false },
-  transactions: { user_id: null, id: null, date: null, kind: 'expense', amount: 0, account_id: null, to_account_id: null, category_id: null, note: null, invoiced: false, pos: false, pos_pct: null, pos_fixed: null, pos_fee: null, recurring_id: null, tax_year: null, tax_part: null, deleted: false, fund_account_id: null, inst_n: null, inst_first: null },
-  recurring: { user_id: null, id: null, kind: 'expense', amount: 0, account_id: null, to_account_id: null, category_id: null, note: null, freq: 'monthly', day: 1, month: null, start_date: null, auto: true, active: true, invoiced: false, deleted: false },
+  transactions: { user_id: null, id: null, date: null, kind: 'expense', amount: 0, account_id: null, to_account_id: null, category_id: null, note: null, invoiced: false, pos: false, pos_pct: null, pos_fixed: null, pos_fee: null, recurring_id: null, tax_year: null, tax_part: null, deleted: false, fund_account_id: null, inst_n: null, inst_first: null, share_id: null, share_cat: null },
+  recurring: { user_id: null, id: null, kind: 'expense', amount: 0, account_id: null, to_account_id: null, category_id: null, note: null, freq: 'monthly', day: 1, month: null, start_date: null, auto: true, active: true, invoiced: false, deleted: false, share_id: null },
 };
 const clean = (t, r) => { const o = {}; for (const [c, def] of Object.entries(COLS[t])) o[c] = r[c] === undefined ? def : r[c]; return o; };
 const emptyData = () => ({ accounts: {}, categories: {}, transactions: {}, recurring: {}, settings: {} });
@@ -350,13 +361,18 @@ function pendingReminders(d) {
   return out.sort((a, b) => a.date.localeCompare(b.date));
 }
 const isAdj = t => String(t.id).startsWith('adj:');
-const txFromRec = (r, date, id) => ({ id, date, kind: r.kind, amount: r.amount, account_id: r.account_id, to_account_id: r.kind === 'transfer' ? r.to_account_id : null, category_id: r.kind === 'transfer' ? null : r.category_id, note: r.note, invoiced: r.kind === 'income' && !!r.invoiced, recurring_id: r.id, deleted: false });
+// ---------- condivisione ----------
+const myShareName = (s, uid) => (s.owner_id === uid ? s.owner_name : s.member_name) || 'Io';
+const partnerName = (s, uid) => s.owner_id === uid ? (s.member_name || s.member_email) : (s.owner_name || 'l’altra persona');
+const activeShares = store => store.shares.filter(s => s.status === 'active');
+const txFromRec = (r, date, id) => ({ id, date, kind: r.kind, amount: r.amount, account_id: r.account_id, to_account_id: r.kind === 'transfer' ? r.to_account_id : null, category_id: r.kind === 'transfer' ? null : r.category_id, note: r.note, invoiced: r.kind === 'income' && !!r.invoiced, recurring_id: r.id, share_id: r.kind === 'expense' ? (r.share_id || null) : null, deleted: false });
 
 // ====================================================================
 //  STORE: copia locale + coda di invio + sincronizzazione con Supabase
 // ====================================================================
 function createStore(uid) {
-  const kC = 'fz2:cache:' + uid, kQ = 'fz2:queue:' + uid, kS = 'fz2:snap:' + uid;
+  const kC = 'fz2:cache:' + uid, kQ = 'fz2:queue:' + uid, kS = 'fz2:snap:' + uid, kSh = 'fz2:shares:' + uid;
+  let shares = lsGet(kSh) || [];
   let data = lsGet(kC) || emptyData();
   for (const t of TABLES) data[t] = data[t] || {};
   data.settings = data.settings || {};
@@ -371,7 +387,7 @@ function createStore(uid) {
 
   function upsertMany(table, rows) {
     const now = new Date().toISOString();
-    for (const row of rows) { const r = { ...clean(table, row), user_id: uid, updated_at: now }; data[table][r.id] = r; enqueue(table, r.id, r); }
+    for (const row of rows) { const r = { ...clean(table, row), user_id: uid, updated_at: now }; if (table === 'transactions') r.share_cat = r.share_id ? (data.categories[r.category_id]?.name || r.share_cat || null) : null; data[table][r.id] = r; enqueue(table, r.id, r); }
     persist(); emit(); schedule();
   }
   const upsert = (table, row) => upsertMany(table, [row]);
@@ -410,11 +426,18 @@ function createStore(uid) {
   async function fetchAll(table) {
     let out = [], from = 0; const size = 1000;
     for (;;) {
-      const { data: rows, error } = await sb.from(table).select('*').order('id').range(from, from + size - 1);
+      const { data: rows, error } = await sb.from(table).select('*').eq('user_id', uid).order('id').range(from, from + size - 1);
       if (error) throw error;
       out = out.concat(rows); if (rows.length < size) break; from += size;
     }
     return out;
+  }
+  // Condivisioni: lette sempre dal server (niente coda offline), copia locale solo per mostrarle offline
+  async function loadShares() {
+    if (!sb) return;
+    const { data: rows, error } = await sb.from('shares').select('*').order('created_at');
+    if (error) { if (/shares|schema cache|does not exist/i.test(error.message || '')) { shares = []; lsSet(kSh, shares); emit(); } return; }
+    shares = rows || []; lsSet(kSh, shares); emit();
   }
   async function pull() {
     if (!sb || st.syncing) return;
@@ -433,7 +456,7 @@ function createStore(uid) {
     } catch (e) {
       st.error = 'Non riesco a scaricare i dati dal server (' + (e.message || e) + '). Stai vedendo la copia salvata su questo dispositivo.';
     } finally { st.syncing = false; emit(); }
-    flush();
+    flush(); loadShares().catch(() => {});
   }
 
   function applyRecurring() {
@@ -471,7 +494,7 @@ function createStore(uid) {
   async function afterLoad() { if (st.loaded) { applyRecurring(); try { await snapshot(false); } catch {} } }
 
   return {
-    get data() { return data; }, st, get pending() { return queue.length; },
+    get data() { return data; }, uid, st, get pending() { return queue.length; }, get shares() { return shares; }, loadShares,
     subscribe(f) { subs.add(f); return () => subs.delete(f); },
     upsert, upsertMany, setSettings, flush, pull, applyRecurring, exportObj, snapshot,
     start() {
@@ -656,6 +679,7 @@ function TxForm({ store, tx, onClose }) {
   const [taxPart, setTaxPart] = useState(tx.tax_part || 'acconto');
   const [taxYear, setTaxYear] = useState(tx.tax_year ? String(tx.tax_year) : '');
   const [fund, setFund] = useState(tx.id ? (tx.fund_account_id || '') : null);
+  const [shareId, setShareId] = useState(tx.share_id || '');
   const [rate, setRate] = useState((Number(tx.inst_n) || 1) > 1), [nRate, setNRate] = useState(String(Number(tx.inst_n) > 1 ? tx.inst_n : 3)), [first, setFirst] = useState(tx.inst_first || 'now');
   const ppAcc = kind === 'expense' && isPaypal(d.accounts[acc]);
   const fundV = fund === null ? (d.accounts[acc]?.charge_account_id || '') : fund;
@@ -675,7 +699,8 @@ function TxForm({ store, tx, onClose }) {
     if (ppAcc && fundV && rate && !(Number(nRate) >= 2 && Number(nRate) <= 60)) return setErr('Il numero di rate va da 2 a 60.');
     const isPos = kind === 'income' && pos;
     store.upsert('transactions', { ...tx, id: tx.id || uuid(), date, kind, amount: round2(a), account_id: acc, to_account_id: kind === 'transfer' ? toAcc : null, category_id: kind === 'transfer' ? null : cat, note: note.trim() || null, invoiced: kind === 'income' && invoiced, pos: isPos, pos_pct: isPos ? pct : null, pos_fixed: isPos ? fix : null, pos_fee: isPos ? fee : null, tax_part: isTaxCat ? taxPart : null, tax_year: isTaxCat ? (Number(taxYear) || Number(defYear(taxPart))) : null, deleted: false,
-      fund_account_id: ppAcc ? (fundV || null) : null, inst_n: ppAcc && fundV && rate ? Number(nRate) : null, inst_first: ppAcc && fundV && rate ? first : null });
+      fund_account_id: ppAcc ? (fundV || null) : null, inst_n: ppAcc && fundV && rate ? Number(nRate) : null, inst_first: ppAcc && fundV && rate ? first : null,
+      share_id: kind === 'expense' ? (shareId || null) : null });
     if (ppAcc || tx.fund_account_id) store.applyRecurring();
     const patch = {}; if (s.last_account !== acc) patch.last_account = acc; if (kind === 'income' && s.default_invoiced !== invoiced) patch.default_invoiced = invoiced;
     if (Object.keys(patch).length) store.setSettings(patch);
@@ -708,6 +733,7 @@ function TxForm({ store, tx, onClose }) {
     ${isTaxCat && html`<label class="f"><span>Questo versamento è</span><div class="seg">${[['acconto', 'Acconto'], ['saldo', 'Saldo'], ['altro', 'Altro']].map(([k, l]) => html`<button type="button" class=${taxPart === k ? 'on' : ''} onClick=${() => setTaxPart(k)}>${l}</button>`)}</div></label>
       <label class="f"><span>Anno dei redditi a cui si riferisce</span><input class="i num" inputmode="numeric" value=${taxYear || defYear(taxPart)} onInput=${e => setTaxYear(e.target.value)} /></label>
       <p class="hint">Esempio: a giugno 2026 il saldo è per i redditi 2025, gli acconti per i redditi 2026.</p>`}
+    ${kind === 'expense' && html`<${SharePick} store=${store} value=${shareId} onChange=${setShareId} />`}
     <label class="f"><span>Nota (facoltativa)</span><input class="i" value=${note} onInput=${e => setNote(e.target.value)} placeholder="Es. nome paziente, negozio…" /></label>
     ${err && html`<div class="err" role="alert">${err}</div>`}
     <button class="btn" onClick=${save}>${isNew ? 'Aggiungi movimento' : 'Salva modifiche'}</button>
@@ -724,7 +750,7 @@ function TxRow({ store, t, onOpen }) {
   const sign = t.kind === 'income' ? '+' : t.kind === 'expense' ? '−' : '';
   return html`<button class="row" onClick=${() => onOpen(t)}>
     <i class="dot" style=${'--c:' + (t.kind === 'transfer' ? 'var(--muted)' : (c?.color || '#999'))}></i>
-    <div class="mid"><div class="t">${title}${t.pos ? html`<span class="tag">POS</span>` : null}${t.recurring_id ? html`<span class="tag">ricorrente</span>` : null}${String(t.id).startsWith('cc:') ? html`<span class="tag">addebito carta</span>` : null}${Number(t.inst_n) > 1 ? html`<span class="tag">${t.inst_n} rate</span>` : null}</div><div class="s">${sub || ' '}</div></div>
+    <div class="mid"><div class="t">${title}${t.pos ? html`<span class="tag">POS</span>` : null}${t.recurring_id ? html`<span class="tag">ricorrente</span>` : null}${String(t.id).startsWith('cc:') ? html`<span class="tag">addebito carta</span>` : null}${Number(t.inst_n) > 1 ? html`<span class="tag">${t.inst_n} rate</span>` : null}${t.share_id && t.kind === 'expense' ? html`<span class="tag">condivisa</span>` : null}</div><div class="s">${sub || ' '}</div></div>
     <div class="amt num"><div class=${cls}>${sign}${eur(t.amount)}</div>${t.pos && t.pos_fee ? html`<div class="s num">comm. ${eur(t.pos_fee)}</div>` : null}</div>
   </button>`;
 }
@@ -857,6 +883,7 @@ function RecForm({ store, rec, onClose }) {
   const [auto, setAuto] = useState(rec.auto ?? true);
   const [active, setActive] = useState(rec.active ?? true);
   const [invoiced, setInvoiced] = useState(!!rec.invoiced);
+  const [shareId, setShareId] = useState(rec.share_id || '');
   const [err, setErr] = useState('');
   useEffect(() => { const c = d.categories[cat]; if (c && c.kind !== kind) setCat(''); }, [kind]);
   const save = () => {
@@ -867,7 +894,7 @@ function RecForm({ store, rec, onClose }) {
     if (kind !== 'transfer' && !cat) return setErr('Scegli una voce.');
     if (!(dd >= 1 && dd <= 31)) return setErr('Il giorno deve essere tra 1 e 31.');
     if (!/^\d{4}-\d{2}-\d{2}$/.test(start)) return setErr('Inserisci una data di inizio valida.');
-    store.upsert('recurring', { ...rec, id: rec.id || uuid(), kind, amount: round2(a), account_id: acc, to_account_id: kind === 'transfer' ? toAcc : null, category_id: kind === 'transfer' ? null : cat, note: note.trim() || null, freq, day: dd, month: freq === 'yearly' ? Number(month) : null, start_date: start, auto, active, invoiced: kind === 'income' && invoiced, deleted: false });
+    store.upsert('recurring', { ...rec, id: rec.id || uuid(), kind, amount: round2(a), account_id: acc, to_account_id: kind === 'transfer' ? toAcc : null, category_id: kind === 'transfer' ? null : cat, note: note.trim() || null, freq, day: dd, month: freq === 'yearly' ? Number(month) : null, start_date: start, auto, active, invoiced: kind === 'income' && invoiced, share_id: kind === 'expense' ? (shareId || null) : null, deleted: false });
     store.applyRecurring(); onClose();
   };
   const del = () => { if (confirm('Eliminare questa ricorrenza? I movimenti già registrati restano.')) { store.upsert('recurring', { ...rec, deleted: true }); onClose(); } };
@@ -886,6 +913,7 @@ function RecForm({ store, rec, onClose }) {
     <div style="margin-top:16px" class="seg"><button class=${auto ? 'on' : ''} onClick=${() => setAuto(true)}>Registra da sola</button><button class=${!auto ? 'on' : ''} onClick=${() => setAuto(false)}>Solo promemoria</button></div>
     <p class="hint">${auto ? 'Il movimento viene aggiunto in automatico alla data prevista.' : 'Alla scadenza ti viene chiesto di registrarlo, così puoi correggere l’importo.'}</p>
     ${kind === 'income' && html`<label class="check"><input type="checkbox" checked=${invoiced} onChange=${e => setInvoiced(e.target.checked)} />Con fattura</label>`}
+    ${kind === 'expense' && html`<${SharePick} store=${store} value=${shareId} onChange=${setShareId} />`}
     <label class="check"><input type="checkbox" checked=${active} onChange=${e => setActive(e.target.checked)} />Attiva</label>
     ${err && html`<div class="err" role="alert">${err}</div>`}
     <button class="btn" onClick=${save}>${isNew ? 'Aggiungi ricorrenza' : 'Salva modifiche'}</button>
@@ -1431,7 +1459,7 @@ function TaxProfile({ store, onClose }) {
 }
 
 // ---------- impostazioni ----------
-function Settings({ store, user, open }) {
+function Settings({ store, user, open, goTab }) {
   const s = store.data.settings;
   const [pct, setPct] = useState(fmtIn(s.pos_pct ?? '')), [fix, setFix] = useState(fmtIn(s.pos_fixed ?? '')), [msg, setMsg] = useState('');
   const savePos = () => { const p = pct.trim() === '' ? null : parseAmt(pct), f = fix.trim() === '' ? null : parseAmt(fix); if (Number.isNaN(p) || Number.isNaN(f)) return setMsg('Valori non validi.'); store.setSettings({ pos_pct: p, pos_fixed: f }); setMsg('Salvato.'); setTimeout(() => setMsg(''), 2000); };
@@ -1440,7 +1468,7 @@ function Settings({ store, user, open }) {
   const nAcc = live(store.data.accounts).length, nCat = live(store.data.categories).length;
   return html`<div>
     <div class="sec">Personalizza</div>
-    <div><button class="setrow" onClick=${() => open('accounts')}><span>Conti</span><small>${nAcc} ›</small></button><button class="setrow" onClick=${() => open('categories')}><span>Voci di entrata e uscita</span><small>${nCat} ›</small></button><button class="setrow" onClick=${() => open('taxprofile')}><span>Profilo fiscale</span><small>›</small></button><button class="setrow" onClick=${() => { store.setSettings({ guide: 'show' }); window.scrollTo(0, 0); }}><span>Guida iniziale</span><small>rivedi ›</small></button></div>
+    <div><button class="setrow" onClick=${() => open('accounts')}><span>Conti</span><small>${nAcc} ›</small></button><button class="setrow" onClick=${() => open('categories')}><span>Voci di entrata e uscita</span><small>${nCat} ›</small></button><button class="setrow" onClick=${() => open('taxprofile')}><span>Profilo fiscale</span><small>›</small></button><button class="setrow" onClick=${() => goTab('shared')}><span>Spese condivise</span><small>${activeShares(store).length ? activeShares(store).map(x => partnerName(x, user.id)).join(', ') + ' ›' : '›'}</small></button><button class="setrow" onClick=${() => { store.setSettings({ guide: 'show' }); window.scrollTo(0, 0); }}><span>Guida iniziale</span><small>rivedi ›</small></button></div>
     <div class="sec">Pagamenti con POS</div>
     <div class="card"><p class="hint" style="margin-top:0">Le condizioni del tuo contratto POS. Vengono proposte in automatico quando segni un incasso con POS.</p>
       <div class="two"><${AmountField} label="Commissione %" value=${pct} onInput=${setPct} /><${AmountField} label="Costo fisso (€)" value=${fix} onInput=${setFix} /></div>
@@ -1468,7 +1496,7 @@ function DeleteAccount({ store, user, onClose }) {
     store.stop();
     const { error } = await sb.rpc('delete_my_account');
     if (error) { setBusy(false); store.start(); return setErr('Eliminazione non riuscita: ' + (error.message || error) + '. Il tuo account e i dati sono ancora al loro posto.'); }
-    for (const k of ['fz2:cache:', 'fz2:queue:', 'fz2:snap:']) { try { localStorage.removeItem(k + user.id); } catch {} }
+    for (const k of ['fz2:cache:', 'fz2:queue:', 'fz2:snap:', 'fz2:shares:']) { try { localStorage.removeItem(k + user.id); } catch {} }
     try { await sb.auth.signOut({ scope: 'local' }); } catch {}
     try { localStorage.removeItem('finanze-auth'); } catch {}
     alert('Account eliminato. Tutti i tuoi dati sono stati cancellati dal server e da questo dispositivo.');
@@ -1612,6 +1640,144 @@ function IosInstallHint() {
 }
 
 // ---------- app principale ----------
+// ---------- spese condivise: scelta nel modulo ----------
+function SharePick({ store, value, onChange }) {
+  const act = activeShares(store); if (!act.length) return null;
+  if (act.length === 1 && (!value || value === act[0].id)) return html`<label class="check"><input type="checkbox" checked=${value === act[0].id} onChange=${e => onChange(e.target.checked ? act[0].id : '')} />Condivisa con ${partnerName(act[0], store.uid)}</label>`;
+  return html`<label class="f"><span>Spesa condivisa</span><select class="i" value=${value} onChange=${e => onChange(e.target.value)}><option value="">Non condivisa</option>
+    ${act.map(x => html`<option value=${x.id}>Con ${partnerName(x, store.uid)}</option>`)}${value && !act.some(x => x.id === value) ? html`<option value=${value}>Condivisione chiusa</option>` : null}</select></label>`;
+}
+
+// ---------- spese condivise: invito ----------
+function ShareInvite({ store, user, onDone }) {
+  const [name, setName] = useState(store.data.settings.share_name || ''), [email, setEmail] = useState(''), [err, setErr] = useState(''), [busy, setBusy] = useState(false);
+  const send = async () => {
+    const n = name.trim(), em = email.trim().toLowerCase(); setErr('');
+    if (!n) return setErr('Scrivi il tuo nome, così l’altra persona sa chi la invita.');
+    if (!/^\S+@\S+\.\S+$/.test(em)) return setErr('Scrivi un indirizzo email valido.');
+    if (em === String(user.email).toLowerCase()) return setErr('Questa è la tua email: scrivi quella dell’altra persona.');
+    if (!navigator.onLine) return setErr('Serve la connessione a internet.');
+    setBusy(true);
+    const { error } = await sb.from('shares').insert({ owner_name: n, member_email: em });
+    setBusy(false);
+    if (error) return setErr(/duplicate|unique/i.test(error.message || '') ? 'Hai già invitato questa persona.' : 'Invito non riuscito: ' + (error.message || error));
+    if (store.data.settings.share_name !== n) store.setSettings({ share_name: n });
+    await store.loadShares(); onDone();
+  };
+  return html`<div class="card">
+    <p class="hint" style="margin-top:0">L’altra persona deve avere un account Finanze con questa email. Vedrà l’invito nella scheda Condivise e, una volta accettato, vedrete entrambi solo le spese segnate come condivise: il resto dei conti resta privato.</p>
+    <label class="f"><span>Il tuo nome (come ti vedrà)</span><input class="i" value=${name} onInput=${e => setName(e.target.value)} placeholder="Es. Luca" /></label>
+    <label class="f"><span>Email dell’altra persona</span><input class="i" type="email" autocomplete="off" value=${email} onInput=${e => setEmail(e.target.value)} /></label>
+    ${err && html`<div class="err" role="alert">${err}</div>`}
+    <button class="btn" disabled=${busy} onClick=${send}>${busy ? 'Invio…' : 'Invia invito'}</button>
+  </div>`;
+}
+
+// ---------- spese condivise: finestra ----------
+function Shared({ store, user, openTx }) {
+  const uid = user.id, d = store.data, all = store.shares;
+  const act = all.filter(x => x.status === 'active');
+  const incoming = all.filter(x => x.status === 'pending' && x.owner_id !== uid);
+  const outgoing = all.filter(x => x.status === 'pending' && x.owner_id === uid);
+  const [sel, setSel] = useState(''), cur = act.find(x => x.id === sel) || act[0];
+  const [other, setOther] = useState({}), [loading, setLoading] = useState(false), [err, setErr] = useState('');
+  const [ym, setYm] = useState(ymOf(todayIso())), [mode, setMode] = useState('month');
+  const [inviting, setInviting] = useState(false), [accName, setAccName] = useState(d.settings.share_name || '');
+  const year = ym.slice(0, 4);
+
+  const load = async () => {
+    if (!cur || !sb) return; setLoading(true); setErr('');
+    try {
+      let out = [], from = 0;
+      for (;;) {
+        const { data: rows, error } = await sb.from('transactions').select('id,user_id,date,kind,amount,note,share_cat').eq('share_id', cur.id).neq('user_id', uid).eq('deleted', false).eq('kind', 'expense').order('id').range(from, from + 999);
+        if (error) throw error;
+        out = out.concat(rows); if (rows.length < 1000) break; from += 1000;
+      }
+      setOther(o => ({ ...o, [cur.id]: out }));
+    } catch (e) { setErr('Non riesco a scaricare le spese di ' + partnerName(cur, uid) + (navigator.onLine ? ': ' + (e.message || e) : ': sei offline.')); }
+    setLoading(false);
+  };
+  useEffect(() => { load(); }, [cur?.id]);
+  const refresh = async () => { await store.loadShares(); load(); };
+
+  const accept = async s => {
+    const n = accName.trim(); if (!n) return alert('Scrivi il tuo nome, così l’altra persona sa chi sei.');
+    const { error } = await sb.rpc('accept_share', { p_id: s.id, p_name: n });
+    if (error) return alert('Non riesco ad accettare: ' + (error.message || error));
+    if (d.settings.share_name !== n) store.setSettings({ share_name: n });
+    store.loadShares();
+  };
+  const remove = async (s, msg) => {
+    if (!confirm(msg)) return;
+    const { error } = await sb.from('shares').delete().eq('id', s.id);
+    if (error) return alert('Operazione non riuscita: ' + (error.message || error));
+    setSel(''); store.loadShares();
+  };
+
+  const inPeriod = t => mode === 'month' ? ymOf(t.date) === ym : String(t.date).startsWith(year);
+  const rows = useMemo(() => {
+    if (!cur) return [];
+    const mine = live(d.transactions).filter(t => t.share_id === cur.id && t.kind === 'expense').map(t => ({ ...t, mine: true, cat: d.categories[t.category_id]?.name || t.share_cat || 'Senza voce' }));
+    const theirs = (other[cur.id] || []).map(t => ({ ...t, mine: false, cat: t.share_cat || 'Senza voce' }));
+    return [...mine, ...theirs].filter(inPeriod).sort((a, b) => b.date.localeCompare(a.date) || String(b.updated_at || '').localeCompare(String(a.updated_at || '')));
+  }, [store.st.version, cur?.id, other, ym, mode]);
+
+  const pendingBlock = html`
+    ${incoming.length > 0 && html`<div class="sec">Inviti ricevuti</div>${incoming.map(s => html`<div class="card" style="margin-bottom:8px">
+      <div><b>${s.owner_name}</b> ti invita a condividere alcune spese.</div>
+      <p class="hint">Vedrete entrambi solo le spese che ognuno segna come condivise. Il resto dei vostri conti resta privato.</p>
+      <label class="f"><span>Il tuo nome (come ti vedrà)</span><input class="i" value=${accName} onInput=${e => setAccName(e.target.value)} /></label>
+      <button class="btn" onClick=${() => accept(s)}>Accetta</button>
+      <button class="linkbtn" style="margin-top:10px" onClick=${() => remove(s, 'Rifiutare l’invito di ' + s.owner_name + '?')}>Rifiuta</button></div>`)}`}
+    ${outgoing.length > 0 && html`<div class="sec">Inviti in attesa</div><div class="list">${outgoing.map(s => html`<div class="row ro"><div class="mid"><div class="t">${s.member_email}</div><div class="s">deve ancora accettare dalla scheda Condivise</div></div>
+      <button class="linkbtn" onClick=${() => remove(s, 'Annullare l’invito a ' + s.member_email + '?')}>Annulla</button></div>`)}</div>`}`;
+
+  const inviteBlock = inviting ? html`<div class="sec">Nuova condivisione</div><${ShareInvite} store=${store} user=${user} onDone=${() => setInviting(false)} />`
+    : html`<button class="btn sec2" onClick=${() => setInviting(true)}>+ Condividi con un’altra persona</button>`;
+
+  if (!cur) return html`<div>
+    ${pendingBlock}
+    ${!incoming.length && !outgoing.length && html`<div class="empty">Qui vedi le spese che dividi con un’altra persona, per esempio casa, bollette o spesa. Ognuno segna le proprie come condivise e qui trovate insieme chi ha pagato cosa.</div>`}
+    ${inviteBlock}
+    <button class="linkbtn" style="margin-top:14px" onClick=${refresh}>Aggiorna</button>
+  </div>`;
+
+  const me = myShareName(cur, uid), him = partnerName(cur, uid);
+  let tMe = 0, tHim = 0; const byCat = {};
+  for (const t of rows) { const a = +t.amount || 0; if (t.mine) tMe += a; else tHim += a; const c = byCat[t.cat] = byCat[t.cat] || { me: 0, him: 0 }; c[t.mine ? 'me' : 'him'] += a; }
+  const tot = tMe + tHim, pMe = tot ? Math.round(tMe / tot * 100) : 0;
+  const cats = Object.entries(byCat).sort((a, b) => (b[1].me + b[1].him) - (a[1].me + a[1].him));
+  const days = []; for (const t of rows) { const last = days[days.length - 1]; if (last && last.date === t.date) last.items.push(t); else days.push({ date: t.date, items: [t] }); }
+  const periodLabel = mode === 'month' ? monthLabel(ym) : 'Anno ' + year;
+
+  return html`<div>
+    ${act.length > 1 && html`<div class="chips" style="margin-bottom:12px">${act.map(x => html`<button class=${'chip' + (x.id === cur.id ? ' on' : '')} onClick=${() => setSel(x.id)}>Con ${partnerName(x, uid)}</button>`)}</div>`}
+    <div class="month"><button class="iconbtn" aria-label="Indietro" onClick=${() => setYm(addMonths(ym, mode === 'month' ? -1 : -12))}>‹</button><h2>${periodLabel}</h2><button class="iconbtn" aria-label="Avanti" onClick=${() => setYm(addMonths(ym, mode === 'month' ? 1 : 12))}>›</button></div>
+    <div class="seg" style="margin-bottom:12px"><button class=${mode === 'month' ? 'on' : ''} onClick=${() => setMode('month')}>Mese</button><button class=${mode === 'year' ? 'on' : ''} onClick=${() => setMode('year')}>Anno</button></div>
+    <div class="who num"><div><small>${me}</small><b>${eur(tMe)}</b></div><div><small>${him}</small><b>${eur(tHim)}</b></div></div>
+    ${tot > 0 && html`<div class="split" aria-hidden="true"><i style=${'width:' + pMe + '%;background:var(--in)'}></i><i style=${'width:' + (100 - pMe) + '%;background:var(--tax)'}></i></div>
+      <div class="hint num" style="display:flex;justify-content:space-between;margin:0"><span>${me} ${pMe}%</span><span>Totale ${eur(tot)}</span><span>${him} ${100 - pMe}%</span></div>`}
+    ${err && html`<div class="err" role="alert">${err}</div>`}
+    ${cats.length > 0 && html`<div class="sec">Per voce</div><div class="card vtab num"><span class="h">Voce</span><span class="h r">${me}</span><span class="h r">${him}</span>
+      ${cats.map(([n, v]) => html`<span>${n}</span><span class="r">${v.me ? eur(v.me) : '–'}</span><span class="r">${v.him ? eur(v.him) : '–'}</span>`)}</div>`}
+    <div class="sec">Movimenti</div>
+    ${loading && !(other[cur.id]) ? html`<div class="empty">Caricamento…</div>`
+      : days.length === 0 ? html`<div class="empty">Nessuna spesa condivisa in ${periodLabel}.<br/>Quando aggiungi una spesa, spunta “Condivisa con ${him}”.</div>`
+      : days.map(g => html`<div class="day">${dayLabel(g.date)}</div><div class="list">${g.items.map(t => {
+          const inner = html`<i class="dot" style=${'--c:' + (t.mine ? 'var(--in)' : 'var(--tax)')}></i>
+            <div class="mid"><div class="t">${t.cat}<span class="tag">${t.mine ? me : him}</span></div><div class="s">${t.note || ' '}</div></div>
+            <div class="amt num out">−${eur(t.amount)}</div>`;
+          return t.mine ? html`<button key=${t.id} class="row" onClick=${() => openTx(d.transactions[t.id])}>${inner}</button>` : html`<div key=${'o' + t.id} class="row ro">${inner}</div>`;
+        })}</div>`)}
+    <p class="hint">Puoi modificare solo le tue spese. Quelle di ${him} le vedi in sola lettura: il resto dei vostri conti resta privato.</p>
+    <button class="linkbtn" onClick=${refresh}>${loading ? 'Aggiornamento…' : 'Aggiorna'}</button>
+    ${pendingBlock}
+    ${inviteBlock}
+    <button class="linkbtn" style="margin-top:18px;color:var(--out)" onClick=${() => remove(cur, 'Chiudere la condivisione con ' + him + '? Nessuna spesa viene cancellata: semplicemente non vedrete più quelle dell’altro.')}>Chiudi la condivisione con ${him}</button>
+  </div>`;
+}
+
 function Main({ user }) {
   const store = useMemo(() => createStore(user.id), [user.id]);
   const [, force] = useState(0);
@@ -1624,6 +1790,7 @@ function Main({ user }) {
   const close = () => setSheet(null);
   if (d.settings.guide === 'show') return html`<${Guide} store=${store} onDone=${k => { store.setSettings({ guide: 'done' }); if (k === 'taxprofile') { setTab('tax'); setSheet({ k }); } window.scrollTo(0, 0); }} />`;
   const TABS = [['mov', '☰', 'Movimenti'], ['charts', '▤', 'Grafici'], ['tax', '%', 'Tasse'], ['rec', '↻', 'Ricorrenti'], ['set', '⚙', 'Impostazioni']];
+  if (store.shares.length || tab === 'shared') TABS.splice(4, 0, ['shared', '⇄', 'Condivise']);
   return html`<div class="wrap">
     <div class="top"><h1>${TABS.find(t => t[0] === tab)[2]}</h1><${SyncPill} store=${store} /></div>
     <${IosInstallHint} />
@@ -1631,10 +1798,11 @@ function Main({ user }) {
     ${tab === 'charts' && html`<${Charts} store=${store} goMov=${goMov} />`}
     ${tab === 'rec' && html`<${Recurring} store=${store} openRec=${r => setSheet({ k: 'rec', v: r })} openPlan=${dl => setSheet({ k: 'plan', v: dl })} />`}
     ${tab === 'tax' && html`<${TaxView} store=${store} openProfile=${() => setSheet({ k: 'taxprofile' })} openTx=${t => setSheet({ k: 'tx', v: t })} openOpening=${y => setSheet({ k: 'opening', v: y })} />`}
-    ${tab === 'set' && html`<${Settings} store=${store} user=${user} open=${k => setSheet({ k })} />`}
-    ${(tab === 'mov' || tab === 'charts' || tab === 'tax') && html`<button class="fab" onClick=${() => setSheet({ k: 'tx', v: {} })}>+ Movimento</button>`}
-    <nav class="tabs"><div class="in2">${TABS.map(([k, ic, l]) => html`<button class=${tab === k ? 'on' : ''} aria-current=${tab === k ? 'page' : null} onClick=${() => { if (k === 'mov') setMovInit(null); setTab(k); }}><span aria-hidden="true">${ic}</span>${l}</button>`)}</div></nav>
-    ${sheet?.k === 'tx' && html`<${TxForm} key=${sheet.v.id || 'new'} store=${store} tx=${sheet.v} onClose=${close} />`}
+    ${tab === 'shared' && html`<${Shared} store=${store} user=${user} openTx=${t => setSheet({ k: 'tx', v: t })} />`}
+    ${tab === 'set' && html`<${Settings} store=${store} user=${user} open=${k => setSheet({ k })} goTab=${k => { setTab(k); window.scrollTo(0, 0); }} />`}
+    ${(tab === 'mov' || tab === 'charts' || tab === 'tax' || (tab === 'shared' && activeShares(store).length > 0)) && html`<button class="fab" onClick=${() => setSheet({ k: 'tx', v: {} })}>+ Movimento</button>`}
+    <nav class="tabs"><div class=${'in2' + (TABS.length > 5 ? ' six' : '')}>${TABS.map(([k, ic, l]) => html`<button class=${tab === k ? 'on' : ''} aria-current=${tab === k ? 'page' : null} onClick=${() => { if (k === 'mov') setMovInit(null); setTab(k); }}><span aria-hidden="true">${ic}</span>${l}</button>`)}</div></nav>
+    ${sheet?.k === 'tx' && html`<${TxForm} key=${sheet.v.id || 'new'} store=${store} tx=${sheet.v.id || tab !== 'shared' || activeShares(store).length !== 1 ? sheet.v : { kind: 'expense', share_id: activeShares(store)[0].id }} onClose=${close} />`}
     ${sheet?.k === 'rec' && html`<${RecForm} key=${sheet.v.id || 'new'} store=${store} rec=${sheet.v} onClose=${close} />`}
     ${sheet?.k === 'accounts' && html`<${AccountsEditor} store=${store} onClose=${close} />`}
     ${sheet?.k === 'categories' && html`<${CategoriesEditor} store=${store} onClose=${close} />`}
