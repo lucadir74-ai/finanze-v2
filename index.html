@@ -779,13 +779,17 @@ function TxForm({ store, tx, onClose }) {
 
 // ---------- riga movimento ----------
 const loanMoveLabel = (role, kind) => role === 'borrow' ? (kind === 'income' ? 'Prestito ricevuto' : 'Restituzione prestito') : (kind === 'expense' ? 'Prestito dato' : 'Rimborso ricevuto');
+// Restituzione già fatta in passato: riduce il debito senza toccare i conti
+const isPastPay = t => isLoanMove(t) && !t.account_id && !t.loan_ref && (+t.loan_amt || 0) < 0;
+const pastLabel = role => role === 'borrow' ? 'Restituzione già fatta' : 'Rimborso già ricevuto';
+const moveLabel = (t, role) => isPastPay(t) ? pastLabel(role) : loanMoveLabel(role, t.kind);
 function TxRow({ store, t, onOpen }) {
   const d = store.data, c = d.categories[t.category_id], a = d.accounts[t.account_id], to = d.accounts[t.to_account_id];
   if (isLoanMove(t)) {
     const ln = findLoan(store, t.loan_id), sub = [a?.name || 'nessun conto', ln ? ln.name + ', ' + loanWho(ln, store) : null, t.note].filter(Boolean).join(', ');
     return html`<button class="row" onClick=${() => onOpen(t)}><i class="dot" style="--c:var(--muted)"></i>
-      <div class="mid"><div class="t">${loanMoveLabel(ln ? loanRole(ln, store.uid) : 'borrow', t.kind)}<span class="tag">prestito</span></div><div class="s">${sub}</div></div>
-      <div class="amt num"><div class="mut">${t.kind === 'income' ? '+' : '−'}${eur(t.amount)}</div></div></button>`;
+      <div class="mid"><div class="t">${moveLabel(t, ln ? loanRole(ln, store.uid) : 'borrow')}<span class="tag">prestito</span></div><div class="s">${sub}</div></div>
+      <div class="amt num"><div class="mut">${t.account_id ? (t.kind === 'income' ? '+' : '−') : ''}${eur(t.amount)}</div>${t.account_id ? null : html`<div class="s">fuori dai conti</div>`}</div></button>`;
   }
   const title = isAdj(t) ? 'Rettifica saldo' : isPpRow(t) ? (t.note && t.note.startsWith('Rata') ? 'Rata ' + (to?.name || 'PayPal') : 'Prelievo ' + (to?.name || 'PayPal')) : String(t.id).startsWith('cc:') ? 'Addebito ' + (to?.name || 'carta') : t.kind === 'transfer' ? 'Giroconto' : (c?.name || 'Senza voce');
   const sub = t.kind === 'transfer' ? `${a?.name || '?'} → ${to?.name || '?'}` : [a?.name, t.note].filter(Boolean).join(', ');
@@ -1883,32 +1887,35 @@ function LoanForm({ store, loan, onClose }) {
 function LoanMoveForm({ store, v, onClose }) {
   const { loan, tx = {}, mirrorOf } = v, isNew = !tx.id, d = store.data;
   const role = loan ? loanRole(loan, store.uid) : 'borrow', isMirror = !!(mirrorOf || tx.loan_ref);
-  const [type, setType] = useState(v.type || (tx.id ? ((+tx.loan_amt || 0) > 0 ? 'add' : 'pay') : 'pay'));
+  const [type, setType] = useState(v.type || (tx.id ? (isPastPay(tx) ? 'past' : (+tx.loan_amt || 0) > 0 ? 'add' : 'pay') : 'pay'));
   const [amount, setAmount] = useState(fmtIn(tx.amount ?? mirrorOf?.amount ?? ''));
   const [date, setDate] = useState(tx.date || mirrorOf?.date || todayIso());
   const [acc, setAcc] = useState(tx.id ? (tx.account_id || '') : loanDefAcc(store));
   const [note, setNote] = useState(tx.note || ''), [err, setErr] = useState('');
   const kind = isMirror ? (mirrorOf ? (mirrorOf.kind === 'income' ? 'expense' : 'income') : tx.kind) : ((role === 'borrow') === (type === 'add') ? 'income' : 'expense');
+  const past = !isMirror && type === 'past';
   const who = loan ? loanWho(loan, store) : '';
   const save = () => {
     const a = parseAmt(amount);
     if (!(a > 0)) return setErr('Inserisci un importo maggiore di zero.');
     if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return setErr('Inserisci una data valida.');
-    store.upsert('transactions', { ...tx, id: tx.id || uuid(), date, kind, amount: round2(a), account_id: acc || null, to_account_id: null, category_id: null, note: note.trim() || null, share_id: null,
+    store.upsert('transactions', { ...tx, id: tx.id || uuid(), date, kind, amount: round2(a), account_id: past ? null : (acc || null), to_account_id: null, category_id: null, note: note.trim() || null, share_id: null,
       loan_id: loan?.id || tx.loan_id, loan_amt: isMirror ? 0 : (type === 'add' ? round2(a) : -round2(a)), loan_ref: isMirror ? (mirrorOf?.id || tx.loan_ref) : null, deleted: false });
-    if (acc && d.settings.last_account !== acc) store.setSettings({ last_account: acc });
+    if (!past && acc && d.settings.last_account !== acc) store.setSettings({ last_account: acc });
     onClose();
   };
   const del = () => { if (confirm('Spostare questo movimento nel cestino? Potrai ripristinarlo dalle impostazioni.')) { store.upsert('transactions', { ...tx, deleted: true }); onClose(); } };
-  const types = role === 'borrow' ? [['pay', 'Restituisco'], ['add', 'Ricevo altri soldi']] : [['pay', 'Mi restituisce'], ['add', 'Presto altri soldi']];
+  const types = role === 'borrow' ? [['pay', 'Restituisco'], ['add', 'Ricevo altri soldi'], ['past', 'Già restituito']] : [['pay', 'Mi restituisce'], ['add', 'Presto altri soldi'], ['past', 'Già rimborsato']];
   return html`<${Sheet} title=${isMirror ? 'Segna sul mio conto' : isNew ? 'Movimento del prestito' : 'Modifica movimento'} onClose=${onClose}>
     ${!loan && html`<p class="hint">Il prestito di questo movimento non esiste più: puoi solo modificarlo o spostarlo nel cestino.</p>`}
     ${loan && html`<p class="hint">${loan.name}, con ${who}</p>`}
     ${isMirror ? html`<p class="hint">${mirrorOf ? `${who} ha segnato ${loanMoveLabel(role === 'borrow' ? 'lend' : 'borrow', mirrorOf.kind).toLowerCase()} di ${eur(mirrorOf.amount)}. ` : ''}Qui registri solo il passaggio sul tuo conto: il debito non cambia, perché l’ha già contato ${who || 'l’altra persona'}.</p>`
       : html`<div class="seg" style="margin-top:10px">${types.map(([k, l]) => html`<button type="button" class=${type === k ? 'on' : ''} onClick=${() => setType(k)}>${l}</button>`)}</div>`}
+    ${past && html`<p class="hint">Per le parti già saldate prima di usare l’app: il prestito scende, i saldi dei conti restano come sono.</p>`}
     <${AmountField} big value=${amount} onInput=${setAmount} />
-    <div class="two"><label class="f"><span>Data</span><input class="i" type="date" value=${date} onInput=${e => setDate(e.target.value)} onChange=${e => setDate(e.target.value)} /></label>
-      <${LoanAccSelect} store=${store} value=${acc} onChange=${setAcc} label=${kind === 'income' ? 'Su quale conto arrivano' : 'Da quale conto escono'} /></div>
+    ${past ? html`<label class="f"><span>Data (anche approssimativa)</span><input class="i" type="date" value=${date} onInput=${e => setDate(e.target.value)} onChange=${e => setDate(e.target.value)} /></label>`
+      : html`<div class="two"><label class="f"><span>Data</span><input class="i" type="date" value=${date} onInput=${e => setDate(e.target.value)} onChange=${e => setDate(e.target.value)} /></label>
+      <${LoanAccSelect} store=${store} value=${acc} onChange=${setAcc} label=${kind === 'income' ? 'Su quale conto arrivano' : 'Da quale conto escono'} /></div>`}
     <label class="f"><span>Nota (facoltativa)</span><input class="i" value=${note} onInput=${e => setNote(e.target.value)} /></label>
     ${err && html`<div class="err" role="alert">${err}</div>`}
     <button class="btn" onClick=${save}>${isNew ? (isMirror ? 'Segna sul mio conto' : 'Aggiungi') : 'Salva modifiche'}</button>
@@ -1928,7 +1935,7 @@ function Loans({ store, user, openSheet, openTx }) {
     try {
       let out = [], from = 0;
       for (;;) {
-        const { data: rows, error } = await sb.from('transactions').select('id,user_id,date,kind,amount,note,share_cat,loan_id,loan_amt,loan_ref,category_id,updated_at').in('loan_id', sharedIds.split(',')).neq('user_id', uid).eq('deleted', false).order('id').range(from, from + 999);
+        const { data: rows, error } = await sb.from('transactions').select('id,user_id,date,kind,amount,note,share_cat,loan_id,loan_amt,loan_ref,category_id,account_id,updated_at').in('loan_id', sharedIds.split(',')).neq('user_id', uid).eq('deleted', false).order('id').range(from, from + 999);
         if (error) throw error;
         out = out.concat(rows); if (rows.length < 1000) break; from += 1000;
       }
@@ -1963,10 +1970,10 @@ function Loans({ store, user, openSheet, openTx }) {
   const s = statOf(cur), role = loanRole(cur, uid), who = loanWho(cur, store), mine = cur.user_id === uid || !cur.user_id;
   const share = cur.share_id ? store.shares.find(x => x.id === cur.share_id) : null, me = share ? myShareName(share, uid) : 'Io';
   const mirrored = new Set(live(d.transactions).filter(t => t.loan_ref).map(t => t.loan_ref));
-  const pending = s.mv.filter(t => !t.mine && isLoanMove(t) && (+t.loan_amt || 0) !== 0 && !mirrored.has(t.id));
+  const pending = s.mv.filter(t => !t.mine && isLoanMove(t) && t.account_id && (+t.loan_amt || 0) !== 0 && !mirrored.has(t.id));
   const list = s.mv.filter(t => (+t.loan_amt || 0) !== 0).sort((a, b) => b.date.localeCompare(a.date) || String(b.updated_at || '').localeCompare(String(a.updated_at || '')));
   const days = []; for (const t of list) { const last = days[days.length - 1]; if (last && last.date === t.date) last.items.push(t); else days.push({ date: t.date, items: [t] }); }
-  const label = t => { const r = t.mine ? role : (role === 'borrow' ? 'lend' : 'borrow'); if (isLoanMove(t)) return loanMoveLabel(r, t.kind); return 'Spesa: ' + (t.mine ? (d.categories[t.category_id]?.name || 'senza voce') : (t.share_cat || 'spesa')) + ' di ' + eur(t.amount); };
+  const label = t => { const r = t.mine ? role : (role === 'borrow' ? 'lend' : 'borrow'); if (isLoanMove(t)) return moveLabel(t, r); return 'Spesa: ' + (t.mine ? (d.categories[t.category_id]?.name || 'senza voce') : (t.share_cat || 'spesa')) + ' di ' + eur(t.amount); };
   return html`<div>
     <button class="linkbtn" onClick=${() => setSel('')}>‹ Tutti i prestiti</button>
     <div class="sec" style="margin-top:6px">${cur.name}${cur.closed ? html`<span class="tag">chiuso</span>` : null}</div>
@@ -1978,6 +1985,7 @@ function Loans({ store, user, openSheet, openTx }) {
     </div>
     ${!cur.closed && html`<button class="btn" onClick=${() => openSheet({ k: 'loanmove', v: { loan: cur, type: 'pay' } })}>${role === 'borrow' ? 'Registra una restituzione' : 'Registra un rimborso ricevuto'}</button>
       <button class="btn sec2" style="margin-top:10px" onClick=${() => openSheet({ k: 'loanmove', v: { loan: cur, type: 'add' } })}>${role === 'borrow' ? 'Ho ricevuto altri soldi' : 'Ho prestato altri soldi'}</button>
+      <button class="linkbtn" style="margin-top:8px" onClick=${() => openSheet({ k: 'loanmove', v: { loan: cur, type: 'past' } })}>+ ${role === 'borrow' ? 'Aggiungi una parte già restituita in passato' : 'Aggiungi una parte già rimborsata in passato'}</button>
       ${role === 'borrow' && html`<p class="hint">Per scalare una spesa dal prestito, quando la aggiungi spunta “Usa per restituire un prestito” e scrivi quanto.</p>`}`}
     ${pending.length > 0 && html`<div class="sec">Da segnare sui tuoi conti</div><div class="list">${pending.map(t => html`<div key=${'p' + t.id} class="row ro pend"><div class="mid"><div class="t">${loanMoveLabel(role === 'borrow' ? 'lend' : 'borrow', t.kind)} da ${who}</div><div class="s">${shortDate(t.date)}${t.note ? ', ' + t.note : ''}</div></div>
       <div style="text-align:right"><div class="amt num">${eur(t.amount)}</div><button class="linkbtn" onClick=${() => openSheet({ k: 'loanmove', v: { loan: cur, mirrorOf: t } })}>Segna</button></div></div>`)}</div>
@@ -1987,7 +1995,7 @@ function Loans({ store, user, openSheet, openTx }) {
       : days.map(g => html`<div class="day">${dayLabel(g.date)}</div><div class="list">${g.items.map(t => {
           const x = +t.loan_amt || 0;
           const inner = html`<i class="dot" style=${'--c:' + (t.mine ? 'var(--in)' : 'var(--tax)')}></i>
-            <div class="mid"><div class="t">${label(t)}${share ? html`<span class="tag">${t.mine ? me : who}</span>` : null}${!t.mine && mirrored.has(t.id) ? html`<span class="tag">sul tuo conto</span>` : null}</div><div class="s">${(t.mine && isLoanMove(t) ? (d.accounts[t.account_id]?.name || 'nessun conto') + (t.note ? ', ' : '') : '') + (t.note || '') || ' '}</div></div>
+            <div class="mid"><div class="t">${label(t)}${share ? html`<span class="tag">${t.mine ? me : who}</span>` : null}${!t.mine && mirrored.has(t.id) ? html`<span class="tag">sul tuo conto</span>` : null}</div><div class="s">${(t.mine && isLoanMove(t) ? (d.accounts[t.account_id]?.name || (isPastPay(t) ? 'fuori dai conti' : 'nessun conto')) + (t.note ? ', ' : '') : '') + (t.note || '') || ' '}</div></div>
             <div class=${'amt num ' + (x < 0 ? 'in' : 'out')}>${x < 0 ? '−' : '+'}${eur(Math.abs(x))}</div>`;
           return t.mine ? html`<button key=${t.id} class="row" onClick=${() => openTx(d.transactions[t.id])}>${inner}</button>` : html`<div key=${'o' + t.id} class="row ro">${inner}</div>`;
         })}</div>`)}
