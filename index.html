@@ -84,6 +84,10 @@ nav.tabs button{flex:1;border:0;background:none;padding:10px 4px 12px;font-size:
 nav.tabs button span{font-size:1.25rem;line-height:1}
 nav.tabs button.on{color:var(--ink);font-weight:700}
 nav.tabs .in2.six button{font-size:.68rem;padding-left:2px;padding-right:2px;min-width:0}
+nav.tabs .in2.seven button{font-size:.64rem;padding-left:1px;padding-right:1px;min-width:0}
+.loanbig{font-size:2rem;font-weight:800;letter-spacing:-.02em;line-height:1.15}
+.loanrow .t small{font-weight:500;color:var(--muted)}
+.pend{border-left:4px solid var(--tax)}
 .who{display:grid;grid-template-columns:1fr 1fr;gap:1px;background:var(--line);border-radius:12px;overflow:hidden}
 .who div{background:var(--card);padding:12px 14px}
 .who small{display:block;color:var(--muted);font-size:.78rem}
@@ -231,15 +235,16 @@ const COLORS = ['#1B7A51','#2F6FB3','#C8661B','#94650F','#8A3FA0','#B0392F','#23
 const SCOPES = { pro: 'Lavoro', personal: 'Personale', tax: 'Tasse e contributi' };
 
 // ---------- modello dati ----------
-const TABLES = ['accounts', 'categories', 'transactions', 'recurring'];
+const TABLES = ['accounts', 'categories', 'transactions', 'recurring', 'loans'];
 const COLS = {
   accounts: { user_id: null, id: null, name: '', icon: null, color: null, initial_balance: 0, sort: 0, archived: false, deleted: false, type: 'bank', charge_day: null, close_day: null, charge_account_id: null, card_limit: null, card_since: null },
   categories: { user_id: null, id: null, name: '', kind: 'expense', scope: 'personal', color: null, sort: 0, archived: false, deleted: false },
-  transactions: { user_id: null, id: null, date: null, kind: 'expense', amount: 0, account_id: null, to_account_id: null, category_id: null, note: null, invoiced: false, pos: false, pos_pct: null, pos_fixed: null, pos_fee: null, recurring_id: null, tax_year: null, tax_part: null, deleted: false, fund_account_id: null, inst_n: null, inst_first: null, share_id: null, share_cat: null },
+  transactions: { user_id: null, id: null, date: null, kind: 'expense', amount: 0, account_id: null, to_account_id: null, category_id: null, note: null, invoiced: false, pos: false, pos_pct: null, pos_fixed: null, pos_fee: null, recurring_id: null, tax_year: null, tax_part: null, deleted: false, fund_account_id: null, inst_n: null, inst_first: null, share_id: null, share_cat: null, loan_id: null, loan_amt: null, loan_ref: null },
   recurring: { user_id: null, id: null, kind: 'expense', amount: 0, account_id: null, to_account_id: null, category_id: null, note: null, freq: 'monthly', day: 1, month: null, start_date: null, auto: true, active: true, invoiced: false, deleted: false, share_id: null },
+  loans: { user_id: null, id: null, name: '', role: 'borrow', counterpart: null, share_id: null, note: null, closed: false, deleted: false },
 };
 const clean = (t, r) => { const o = {}; for (const [c, def] of Object.entries(COLS[t])) o[c] = r[c] === undefined ? def : r[c]; return o; };
-const emptyData = () => ({ accounts: {}, categories: {}, transactions: {}, recurring: {}, settings: {} });
+const emptyData = () => ({ accounts: {}, categories: {}, transactions: {}, recurring: {}, loans: {}, settings: {} });
 
 // Effetto di un movimento sui saldi dei conti
 function effects(t) {
@@ -361,6 +366,15 @@ function pendingReminders(d) {
   return out.sort((a, b) => a.date.localeCompare(b.date));
 }
 const isAdj = t => String(t.id).startsWith('adj:');
+// ---------- prestiti ----------
+// Movimento di solo prestito (soldi ricevuti/dati/restituiti): sposta il saldo del conto ma non è un'entrata o una spesa
+const isLoanMove = t => !!t.loan_id && !t.category_id && t.kind !== 'transfer';
+const isOff = t => isAdj(t) || isLoanMove(t);
+// Il mio ruolo in un prestito (chi l'ha creato lo vede dal suo lato, l'altra persona dal lato opposto)
+const loanRole = (l, uid) => l.user_id === uid || !l.user_id ? l.role : (l.role === 'borrow' ? 'lend' : 'borrow');
+const loanWho = (l, store) => { if (l.share_id) { const s = store.shares.find(x => x.id === l.share_id); return s ? partnerName(s, store.uid) : 'persona condivisa'; } return l.counterpart || 'altra persona'; };
+const allLoans = store => [...live(store.data.loans), ...store.otherLoans.filter(l => !l.deleted)];
+const findLoan = (store, id) => store.data.loans[id] || store.otherLoans.find(l => l.id === id) || null;
 // ---------- condivisione ----------
 const myShareName = (s, uid) => (s.owner_id === uid ? s.owner_name : s.member_name) || 'Io';
 const partnerName = (s, uid) => s.owner_id === uid ? (s.member_name || s.member_email) : (s.owner_name || 'l’altra persona');
@@ -371,8 +385,9 @@ const txFromRec = (r, date, id) => ({ id, date, kind: r.kind, amount: r.amount, 
 //  STORE: copia locale + coda di invio + sincronizzazione con Supabase
 // ====================================================================
 function createStore(uid) {
-  const kC = 'fz2:cache:' + uid, kQ = 'fz2:queue:' + uid, kS = 'fz2:snap:' + uid, kSh = 'fz2:shares:' + uid;
+  const kC = 'fz2:cache:' + uid, kQ = 'fz2:queue:' + uid, kS = 'fz2:snap:' + uid, kSh = 'fz2:shares:' + uid, kOL = 'fz2:oloans:' + uid;
   let shares = lsGet(kSh) || [];
+  let otherLoans = lsGet(kOL) || [];
   let data = lsGet(kC) || emptyData();
   for (const t of TABLES) data[t] = data[t] || {};
   data.settings = data.settings || {};
@@ -438,6 +453,14 @@ function createStore(uid) {
     const { data: rows, error } = await sb.from('shares').select('*').order('created_at');
     if (error) { if (/shares|schema cache|does not exist/i.test(error.message || '')) { shares = []; lsSet(kSh, shares); emit(); } return; }
     shares = rows || []; lsSet(kSh, shares); emit();
+    loadOtherLoans().catch(() => {});
+  }
+  // Prestiti condivisi creati dall'altra persona (la regola del database mostra solo quelli delle condivisioni attive)
+  async function loadOtherLoans() {
+    if (!sb) return;
+    const { data: rows, error } = await sb.from('loans').select('*').neq('user_id', uid).eq('deleted', false);
+    if (error) return;
+    otherLoans = rows || []; lsSet(kOL, otherLoans); emit();
   }
   async function pull() {
     if (!sb || st.syncing) return;
@@ -494,7 +517,7 @@ function createStore(uid) {
   async function afterLoad() { if (st.loaded) { applyRecurring(); try { await snapshot(false); } catch {} } }
 
   return {
-    get data() { return data; }, uid, st, get pending() { return queue.length; }, get shares() { return shares; }, loadShares,
+    get data() { return data; }, uid, st, get pending() { return queue.length; }, get shares() { return shares; }, loadShares, get otherLoans() { return otherLoans; }, loadOtherLoans,
     subscribe(f) { subs.add(f); return () => subs.delete(f); },
     upsert, upsertMany, setSettings, flush, pull, applyRecurring, exportObj, snapshot,
     start() {
@@ -680,6 +703,10 @@ function TxForm({ store, tx, onClose }) {
   const [taxYear, setTaxYear] = useState(tx.tax_year ? String(tx.tax_year) : '');
   const [fund, setFund] = useState(tx.id ? (tx.fund_account_id || '') : null);
   const [shareId, setShareId] = useState(tx.share_id || '');
+  const borrowLoans = allLoans(store).filter(l => loanRole(l, store.uid) === 'borrow' && (!l.closed || l.id === tx.loan_id));
+  const [useLoan, setUseLoan] = useState(!!tx.loan_id && !!tx.category_id);
+  const [loanId, setLoanId] = useState(tx.loan_id || borrowLoans[0]?.id || '');
+  const [loanAmt, setLoanAmt] = useState(tx.loan_amt ? fmtIn(-tx.loan_amt) : '');
   const [rate, setRate] = useState((Number(tx.inst_n) || 1) > 1), [nRate, setNRate] = useState(String(Number(tx.inst_n) > 1 ? tx.inst_n : 3)), [first, setFirst] = useState(tx.inst_first || 'now');
   const ppAcc = kind === 'expense' && isPaypal(d.accounts[acc]);
   const fundV = fund === null ? (d.accounts[acc]?.charge_account_id || '') : fund;
@@ -697,10 +724,13 @@ function TxForm({ store, tx, onClose }) {
     if (kind !== 'transfer' && !cat && !isAdj(tx)) return setErr('Scegli una voce.');
     if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return setErr('Inserisci una data valida.');
     if (ppAcc && fundV && rate && !(Number(nRate) >= 2 && Number(nRate) <= 60)) return setErr('Il numero di rate va da 2 a 60.');
+    const withLoan = kind === 'expense' && useLoan && borrowLoans.some(l => l.id === loanId), la = parseAmt(loanAmt);
+    if (withLoan && !(la > 0)) return setErr('Scrivi quanto di questa spesa scala dal prestito.');
+    if (withLoan && la > a + 0.004) return setErr('La parte che scala dal prestito non può superare l’importo della spesa.');
     const isPos = kind === 'income' && pos;
     store.upsert('transactions', { ...tx, id: tx.id || uuid(), date, kind, amount: round2(a), account_id: acc, to_account_id: kind === 'transfer' ? toAcc : null, category_id: kind === 'transfer' ? null : cat, note: note.trim() || null, invoiced: kind === 'income' && invoiced, pos: isPos, pos_pct: isPos ? pct : null, pos_fixed: isPos ? fix : null, pos_fee: isPos ? fee : null, tax_part: isTaxCat ? taxPart : null, tax_year: isTaxCat ? (Number(taxYear) || Number(defYear(taxPart))) : null, deleted: false,
       fund_account_id: ppAcc ? (fundV || null) : null, inst_n: ppAcc && fundV && rate ? Number(nRate) : null, inst_first: ppAcc && fundV && rate ? first : null,
-      share_id: kind === 'expense' ? (shareId || null) : null });
+      share_id: kind === 'expense' ? (shareId || null) : null, loan_id: withLoan ? loanId : null, loan_amt: withLoan ? -round2(la) : null, loan_ref: null });
     if (ppAcc || tx.fund_account_id) store.applyRecurring();
     const patch = {}; if (s.last_account !== acc) patch.last_account = acc; if (kind === 'income' && s.default_invoiced !== invoiced) patch.default_invoiced = invoiced;
     if (Object.keys(patch).length) store.setSettings(patch);
@@ -734,6 +764,12 @@ function TxForm({ store, tx, onClose }) {
       <label class="f"><span>Anno dei redditi a cui si riferisce</span><input class="i num" inputmode="numeric" value=${taxYear || defYear(taxPart)} onInput=${e => setTaxYear(e.target.value)} /></label>
       <p class="hint">Esempio: a giugno 2026 il saldo è per i redditi 2025, gli acconti per i redditi 2026.</p>`}
     ${kind === 'expense' && html`<${SharePick} store=${store} value=${shareId} onChange=${setShareId} />`}
+    ${kind === 'expense' && borrowLoans.length > 0 && html`<label class="check"><input type="checkbox" checked=${useLoan} onChange=${e => { setUseLoan(e.target.checked); if (!loanId) setLoanId(borrowLoans[0].id); }} />Usa per restituire un prestito</label>
+      ${useLoan && html`${borrowLoans.length > 1 ? html`<label class="f"><span>Prestito</span><select class="i" value=${loanId} onChange=${e => setLoanId(e.target.value)}>${borrowLoans.map(l => html`<option value=${l.id}>${l.name}, con ${loanWho(l, store)}</option>`)}</select></label>`
+          : html`<p class="hint">Prestito: ${borrowLoans[0].name}, con ${loanWho(borrowLoans[0], store)}</p>`}
+        <${AmountField} label="Quanto scala dal prestito" value=${loanAmt} onInput=${setLoanAmt} />
+        <div class="chips" style="margin-top:8px"><button type="button" class="chip" onClick=${() => a > 0 && setLoanAmt(fmtIn(round2(a)))}>Tutta la spesa</button><button type="button" class="chip" onClick=${() => a > 0 && setLoanAmt(fmtIn(round2(a / 2)))}>Metà</button></div>
+        <p class="hint">La spesa resta tra le tue uscite; il prestito scende della cifra che scrivi qui.</p>`}`}
     <label class="f"><span>Nota (facoltativa)</span><input class="i" value=${note} onInput=${e => setNote(e.target.value)} placeholder="Es. nome paziente, negozio…" /></label>
     ${err && html`<div class="err" role="alert">${err}</div>`}
     <button class="btn" onClick=${save}>${isNew ? 'Aggiungi movimento' : 'Salva modifiche'}</button>
@@ -742,15 +778,22 @@ function TxForm({ store, tx, onClose }) {
 }
 
 // ---------- riga movimento ----------
+const loanMoveLabel = (role, kind) => role === 'borrow' ? (kind === 'income' ? 'Prestito ricevuto' : 'Restituzione prestito') : (kind === 'expense' ? 'Prestito dato' : 'Rimborso ricevuto');
 function TxRow({ store, t, onOpen }) {
   const d = store.data, c = d.categories[t.category_id], a = d.accounts[t.account_id], to = d.accounts[t.to_account_id];
+  if (isLoanMove(t)) {
+    const ln = findLoan(store, t.loan_id), sub = [a?.name || 'nessun conto', ln ? ln.name + ', ' + loanWho(ln, store) : null, t.note].filter(Boolean).join(', ');
+    return html`<button class="row" onClick=${() => onOpen(t)}><i class="dot" style="--c:var(--muted)"></i>
+      <div class="mid"><div class="t">${loanMoveLabel(ln ? loanRole(ln, store.uid) : 'borrow', t.kind)}<span class="tag">prestito</span></div><div class="s">${sub}</div></div>
+      <div class="amt num"><div class="mut">${t.kind === 'income' ? '+' : '−'}${eur(t.amount)}</div></div></button>`;
+  }
   const title = isAdj(t) ? 'Rettifica saldo' : isPpRow(t) ? (t.note && t.note.startsWith('Rata') ? 'Rata ' + (to?.name || 'PayPal') : 'Prelievo ' + (to?.name || 'PayPal')) : String(t.id).startsWith('cc:') ? 'Addebito ' + (to?.name || 'carta') : t.kind === 'transfer' ? 'Giroconto' : (c?.name || 'Senza voce');
   const sub = t.kind === 'transfer' ? `${a?.name || '?'} → ${to?.name || '?'}` : [a?.name, t.note].filter(Boolean).join(', ');
   const cls = t.kind === 'income' ? 'in' : t.kind === 'transfer' ? 'mut' : (c?.scope === 'tax' ? 'tx' : 'out');
   const sign = t.kind === 'income' ? '+' : t.kind === 'expense' ? '−' : '';
   return html`<button class="row" onClick=${() => onOpen(t)}>
     <i class="dot" style=${'--c:' + (t.kind === 'transfer' ? 'var(--muted)' : (c?.color || '#999'))}></i>
-    <div class="mid"><div class="t">${title}${t.pos ? html`<span class="tag">POS</span>` : null}${t.recurring_id ? html`<span class="tag">ricorrente</span>` : null}${String(t.id).startsWith('cc:') ? html`<span class="tag">addebito carta</span>` : null}${Number(t.inst_n) > 1 ? html`<span class="tag">${t.inst_n} rate</span>` : null}${t.share_id && t.kind === 'expense' ? html`<span class="tag">condivisa</span>` : null}</div><div class="s">${sub || ' '}</div></div>
+    <div class="mid"><div class="t">${title}${t.pos ? html`<span class="tag">POS</span>` : null}${t.recurring_id ? html`<span class="tag">ricorrente</span>` : null}${String(t.id).startsWith('cc:') ? html`<span class="tag">addebito carta</span>` : null}${Number(t.inst_n) > 1 ? html`<span class="tag">${t.inst_n} rate</span>` : null}${t.share_id && t.kind === 'expense' ? html`<span class="tag">condivisa</span>` : null}${t.loan_id && t.kind === 'expense' ? html`<span class="tag">scala prestito</span>` : null}</div><div class="s">${sub || ' '}</div></div>
     <div class="amt num"><div class=${cls}>${sign}${eur(t.amount)}</div>${t.pos && t.pos_fee ? html`<div class="s num">comm. ${eur(t.pos_fee)}</div>` : null}</div>
   </button>`;
 }
@@ -764,7 +807,7 @@ function Movements({ store, openTx, goTab, init }) {
   const [fCat, setFCat] = useState(init?.cat || '');
   const year = ym.slice(0, 4);
   const inPeriod = t => mode === 'month' ? ymOf(t.date) === ym : t.date.startsWith(year);
-  const catOk = t => !fCat || (fCat === '_none' ? (t.kind !== 'transfer' && !isAdj(t) && !t.category_id) : fCat === '_pos' ? +(t.pos_fee || 0) > 0 : t.category_id === fCat);
+  const catOk = t => !fCat || (fCat === '_none' ? (t.kind !== 'transfer' && !isOff(t) && !t.category_id) : fCat === '_pos' ? +(t.pos_fee || 0) > 0 : t.category_id === fCat);
   const periodLabel = mode === 'month' ? monthLabel(ym) : 'Anno ' + year;
   const bal = useMemo(() => balances(d), [store.st.version]);
   const accs = live(d.accounts).filter(a => !a.archived || Math.abs(bal[a.id] || 0) > 0.004).sort(bySort);
@@ -772,7 +815,7 @@ function Movements({ store, openTx, goTab, init }) {
   const reminders = useMemo(() => [...pendingReminders(d), ...taxWindows(d).due], [store.st.version]);
   const txs = useMemo(() => live(d.transactions).filter(t => inPeriod(t) && (!fAcc || t.account_id === fAcc || t.to_account_id === fAcc) && catOk(t))
     .sort((a, b) => b.date.localeCompare(a.date) || String(b.updated_at).localeCompare(String(a.updated_at))), [store.st.version, ym, mode, fAcc, fCat]);
-  let inc = 0, exp = 0; for (const t of txs) { if (isAdj(t)) continue; if (t.kind === 'income') { inc += +t.amount; exp += +(t.pos_fee || 0); } else if (t.kind === 'expense') exp += +t.amount; }
+  let inc = 0, exp = 0; for (const t of txs) { if (isOff(t)) continue; if (t.kind === 'income') { inc += +t.amount; exp += +(t.pos_fee || 0); } else if (t.kind === 'expense') exp += +t.amount; }
   const days = []; for (const t of txs) { const last = days[days.length - 1]; if (last && last.date === t.date) last.items.push(t); else days.push({ date: t.date, items: [t] }); }
   const cats = live(d.categories).sort(bySort);
 
@@ -835,14 +878,14 @@ function Charts({ store, goMov }) {
   const data = useMemo(() => {
     const ex = {}, inc = {}, scope = { pro: 0, personal: 0, tax: 0 }; let posFees = 0;
     for (const t of live(d.transactions)) {
-      if (!inPeriod(t) || t.kind === 'transfer' || isAdj(t)) continue;
+      if (!inPeriod(t) || t.kind === 'transfer' || isOff(t)) continue;
       const c = d.categories[t.category_id], key = t.category_id || '_none';
       if (t.kind === 'expense') { ex[key] = (ex[key] || 0) + +t.amount; scope[c?.scope || 'personal'] += +t.amount; }
       else { inc[key] = (inc[key] || 0) + +t.amount; if (t.pos_fee) { posFees += +t.pos_fee; scope.pro += +t.pos_fee; } }
     }
     const toRows = o => Object.entries(o).map(([id, v]) => ({ id, name: d.categories[id]?.name || 'Senza voce', color: d.categories[id]?.color, v: round2(v) })).sort((a, b) => b.v - a.v);
     const exRows = toRows(ex); if (posFees) { exRows.push({ id: '_pos', name: 'Commissioni POS', color: '#4B5563', v: round2(posFees) }); exRows.sort((a, b) => b.v - a.v); }
-    const trend = []; for (let i = 11; i >= 0; i--) { const m = addMonths(ym, -i); let a = 0, b = 0; for (const t of live(d.transactions)) { if (ymOf(t.date) !== m || isAdj(t)) continue; if (t.kind === 'income') { a += +t.amount; b += +(t.pos_fee || 0); } else if (t.kind === 'expense') b += +t.amount; } trend.push({ m, a, b }); }
+    const trend = []; for (let i = 11; i >= 0; i--) { const m = addMonths(ym, -i); let a = 0, b = 0; for (const t of live(d.transactions)) { if (ymOf(t.date) !== m || isOff(t)) continue; if (t.kind === 'income') { a += +t.amount; b += +(t.pos_fee || 0); } else if (t.kind === 'expense') b += +t.amount; } trend.push({ m, a, b }); }
     return { exRows, inRows: toRows(inc), scope, trend };
   }, [store.st.version, ym, mode]);
   const exTot = data.exRows.reduce((s, r) => s + r.v, 0), inTot = data.inRows.reduce((s, r) => s + r.v, 0);
@@ -1127,7 +1170,7 @@ function irpef(imp) { let tax = 0, prev = 0; for (const [lim, rate] of IRPEF) { 
 
 function computeTax(d, P, N) {
   const Y = String(N), today = todayIso(), cur = Number(today.slice(0, 4));
-  const txs = live(d.transactions).filter(t => !isAdj(t));
+  const txs = live(d.transactions).filter(t => !isOff(t));
   const onlyInv = P.only_invoiced !== false;
   let incassi = 0, spese = 0, contribPagatiN = 0, accontiN = 0, contribPerN = 0, hasData = false;
   for (const t of txs) {
@@ -1368,7 +1411,7 @@ function TaxView({ store, openProfile, openTx, openOpening }) {
       <button class="btn sec2" style="margin-top:10px" onClick=${() => openOpening(N)}>${num(r.opening.incassi) ? 'Modifica i totali' : 'Inserisci i totali'}</button></div>
     <div class="sec">Versamenti registrati</div>
     ${(() => {
-      const list = live(d.transactions).filter(t => t.kind === 'expense' && !isAdj(t)).map(t => ({ t, ti: taxInfo(t, d, P) }))
+      const list = live(d.transactions).filter(t => t.kind === 'expense' && !isOff(t)).map(t => ({ t, ti: taxInfo(t, d, P) }))
         .filter(x => x.ti && (x.ti.year === N || x.t.date.startsWith(String(N)))).sort((a, b) => a.t.date.localeCompare(b.t.date));
       if (!list.length) return html`<div class="empty">Nessun versamento di tasse o contributi riferito al ${N} o pagato nel ${N}.</div>`;
       return html`<div class="list">${list.map(({ t, ti }) => html`<button class="row" onClick=${() => openTx(t)}>
@@ -1468,7 +1511,7 @@ function Settings({ store, user, open, goTab }) {
   const nAcc = live(store.data.accounts).length, nCat = live(store.data.categories).length;
   return html`<div>
     <div class="sec">Personalizza</div>
-    <div><button class="setrow" onClick=${() => open('accounts')}><span>Conti</span><small>${nAcc} ›</small></button><button class="setrow" onClick=${() => open('categories')}><span>Voci di entrata e uscita</span><small>${nCat} ›</small></button><button class="setrow" onClick=${() => open('taxprofile')}><span>Profilo fiscale</span><small>›</small></button><button class="setrow" onClick=${() => goTab('shared')}><span>Spese condivise</span><small>${activeShares(store).length ? activeShares(store).map(x => partnerName(x, user.id)).join(', ') + ' ›' : '›'}</small></button><button class="setrow" onClick=${() => { store.setSettings({ guide: 'show' }); window.scrollTo(0, 0); }}><span>Guida iniziale</span><small>rivedi ›</small></button></div>
+    <div><button class="setrow" onClick=${() => open('accounts')}><span>Conti</span><small>${nAcc} ›</small></button><button class="setrow" onClick=${() => open('categories')}><span>Voci di entrata e uscita</span><small>${nCat} ›</small></button><button class="setrow" onClick=${() => open('taxprofile')}><span>Profilo fiscale</span><small>›</small></button><button class="setrow" onClick=${() => goTab('shared')}><span>Spese condivise</span><small>${activeShares(store).length ? activeShares(store).map(x => partnerName(x, user.id)).join(', ') + ' ›' : '›'}</small></button><button class="setrow" onClick=${() => goTab('loans')}><span>Prestiti</span><small>${allLoans(store).filter(l => !l.closed).length ? allLoans(store).filter(l => !l.closed).length + ' aperti ›' : '›'}</small></button><button class="setrow" onClick=${() => { store.setSettings({ guide: 'show' }); window.scrollTo(0, 0); }}><span>Guida iniziale</span><small>rivedi ›</small></button></div>
     <div class="sec">Pagamenti con POS</div>
     <div class="card"><p class="hint" style="margin-top:0">Le condizioni del tuo contratto POS. Vengono proposte in automatico quando segni un incasso con POS.</p>
       <div class="two"><${AmountField} label="Commissione %" value=${pct} onInput=${setPct} /><${AmountField} label="Costo fisso (€)" value=${fix} onInput=${setFix} /></div>
@@ -1778,6 +1821,182 @@ function Shared({ store, user, openTx }) {
   </div>`;
 }
 
+// ---------- prestiti: scelta del conto (anche nessuno) ----------
+function LoanAccSelect({ store, value, onChange, label }) {
+  const accs = live(store.data.accounts).filter(a => !a.archived || a.id === value).sort(bySort);
+  return html`<label class="f"><span>${label}</span><select class="i" value=${value} onChange=${e => onChange(e.target.value)}>
+    <option value="">Nessun conto (conta solo nel prestito)</option>${accs.map(a => html`<option value=${a.id}>${(a.icon ? a.icon + ' ' : '') + a.name}</option>`)}</select></label>`;
+}
+const loanDefAcc = store => { const s = store.data.settings, d = store.data; return d.accounts[s.last_account] && !d.accounts[s.last_account].deleted ? s.last_account : (live(d.accounts).filter(a => !a.archived).sort(bySort)[0]?.id || ''); };
+
+// ---------- prestiti: nuovo / modifica ----------
+function LoanForm({ store, loan, onClose }) {
+  const isNew = !loan.id, act = activeShares(store), d = store.data;
+  const [name, setName] = useState(loan.name || ''), [role, setRole] = useState(loan.role || 'borrow');
+  const [who, setWho] = useState(isNew ? (act[0]?.id || '') : (loan.share_id || '')), [cp, setCp] = useState(loan.counterpart || '');
+  const [amount, setAmount] = useState(''), [date, setDate] = useState(todayIso()), [acc, setAcc] = useState(loanDefAcc(store));
+  const [note, setNote] = useState(loan.note || ''), [closed, setClosed] = useState(!!loan.closed), [err, setErr] = useState('');
+  const whoName = who ? partnerName(act.find(x => x.id === who) || {}, store.uid) : (cp.trim() || '');
+  const save = () => {
+    if (isNew) {
+      const a = parseAmt(amount);
+      if (!(a > 0)) return setErr('Inserisci l’importo del prestito.');
+      if (!who && !cp.trim()) return setErr('Scrivi con chi è il prestito (persona o banca).');
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return setErr('Inserisci una data valida.');
+      const id = uuid();
+      store.upsert('loans', { id, name: name.trim() || 'Prestito ' + whoName, role, share_id: who || null, counterpart: who ? null : cp.trim(), note: note.trim() || null, closed: false, deleted: false });
+      store.upsert('transactions', { id: uuid(), date, kind: role === 'borrow' ? 'income' : 'expense', amount: round2(a), account_id: acc || null, category_id: null, note: null, loan_id: id, loan_amt: round2(a), loan_ref: null, deleted: false });
+      if (acc && d.settings.last_account !== acc) store.setSettings({ last_account: acc });
+    } else {
+      if (!loan.share_id && !cp.trim()) return setErr('Scrivi con chi è il prestito.');
+      store.upsert('loans', { ...loan, name: name.trim() || loan.name, counterpart: loan.share_id ? null : cp.trim(), note: note.trim() || null, closed });
+    }
+    onClose();
+  };
+  const del = () => {
+    if (!confirm('Eliminare questo prestito? I suoi movimenti vanno nel cestino; le spese che lo scalavano restano tra le uscite ma non sono più collegate.')) return;
+    const mine = live(d.transactions).filter(t => t.loan_id === loan.id);
+    store.upsertMany('transactions', mine.map(t => isLoanMove(t) ? { ...t, deleted: true } : { ...t, loan_id: null, loan_amt: null }));
+    store.upsert('loans', { ...loan, deleted: true });
+    onClose();
+  };
+  return html`<${Sheet} title=${isNew ? 'Nuovo prestito' : 'Modifica prestito'} onClose=${onClose}>
+    ${isNew ? html`<div class="seg" style="margin-top:10px">${[['borrow', 'Ricevo un prestito'], ['lend', 'Faccio un prestito']].map(([k, l]) => html`<button type="button" class=${role === k ? 'on' : ''} onClick=${() => setRole(k)}>${l}</button>`)}</div>`
+      : html`<p class="hint">${loan.role === 'borrow' ? 'Prestito ricevuto' : 'Prestito fatto'}${loan.share_id ? ', condiviso con ' + loanWho(loan, store) : ''}</p>`}
+    ${isNew && act.length > 0 && html`<label class="f"><span>${role === 'borrow' ? 'Chi te lo fa' : 'A chi lo fai'}</span><select class="i" value=${who} onChange=${e => setWho(e.target.value)}>
+      ${act.map(x => html`<option value=${x.id}>${partnerName(x, store.uid)} (condiviso)</option>`)}<option value="">Un’altra persona o una banca</option></select></label>`}
+    ${(isNew ? !who : !loan.share_id) && html`<label class="f"><span>${role === 'borrow' ? 'Chi te lo fa' : 'A chi lo fai'}</span><input class="i" value=${cp} onInput=${e => setCp(e.target.value)} placeholder="Es. banca, amico…" /></label>`}
+    ${isNew && html`<${AmountField} big value=${amount} onInput=${setAmount} label="Importo" />
+      <div class="two"><label class="f"><span>Data</span><input class="i" type="date" value=${date} onInput=${e => setDate(e.target.value)} onChange=${e => setDate(e.target.value)} /></label>
+        <${LoanAccSelect} store=${store} value=${acc} onChange=${setAcc} label=${role === 'borrow' ? 'Su quale conto arrivano' : 'Da quale conto escono'} /></div>
+      <p class="hint">I soldi spostano il saldo del conto ma non contano come entrata o spesa, né nelle tasse.</p>`}
+    <label class="f"><span>Nome (facoltativo)</span><input class="i" value=${name} onInput=${e => setName(e.target.value)} placeholder=${'Prestito ' + (whoName || '')} /></label>
+    <label class="f"><span>Nota (facoltativa)</span><input class="i" value=${note} onInput=${e => setNote(e.target.value)} /></label>
+    ${!isNew && html`<label class="check"><input type="checkbox" checked=${closed} onChange=${e => setClosed(e.target.checked)} />Prestito chiuso</label>`}
+    ${err && html`<div class="err" role="alert">${err}</div>`}
+    <button class="btn" onClick=${save}>${isNew ? 'Crea prestito' : 'Salva modifiche'}</button>
+    ${!isNew && html`<button class="btn danger" onClick=${del}>Elimina prestito</button>`}
+  <//>`;
+}
+
+// ---------- prestiti: movimento (altri soldi, restituzione, o "segna sul mio conto") ----------
+function LoanMoveForm({ store, v, onClose }) {
+  const { loan, tx = {}, mirrorOf } = v, isNew = !tx.id, d = store.data;
+  const role = loan ? loanRole(loan, store.uid) : 'borrow', isMirror = !!(mirrorOf || tx.loan_ref);
+  const [type, setType] = useState(v.type || (tx.id ? ((+tx.loan_amt || 0) > 0 ? 'add' : 'pay') : 'pay'));
+  const [amount, setAmount] = useState(fmtIn(tx.amount ?? mirrorOf?.amount ?? ''));
+  const [date, setDate] = useState(tx.date || mirrorOf?.date || todayIso());
+  const [acc, setAcc] = useState(tx.id ? (tx.account_id || '') : loanDefAcc(store));
+  const [note, setNote] = useState(tx.note || ''), [err, setErr] = useState('');
+  const kind = isMirror ? (mirrorOf ? (mirrorOf.kind === 'income' ? 'expense' : 'income') : tx.kind) : ((role === 'borrow') === (type === 'add') ? 'income' : 'expense');
+  const who = loan ? loanWho(loan, store) : '';
+  const save = () => {
+    const a = parseAmt(amount);
+    if (!(a > 0)) return setErr('Inserisci un importo maggiore di zero.');
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return setErr('Inserisci una data valida.');
+    store.upsert('transactions', { ...tx, id: tx.id || uuid(), date, kind, amount: round2(a), account_id: acc || null, to_account_id: null, category_id: null, note: note.trim() || null, share_id: null,
+      loan_id: loan?.id || tx.loan_id, loan_amt: isMirror ? 0 : (type === 'add' ? round2(a) : -round2(a)), loan_ref: isMirror ? (mirrorOf?.id || tx.loan_ref) : null, deleted: false });
+    if (acc && d.settings.last_account !== acc) store.setSettings({ last_account: acc });
+    onClose();
+  };
+  const del = () => { if (confirm('Spostare questo movimento nel cestino? Potrai ripristinarlo dalle impostazioni.')) { store.upsert('transactions', { ...tx, deleted: true }); onClose(); } };
+  const types = role === 'borrow' ? [['pay', 'Restituisco'], ['add', 'Ricevo altri soldi']] : [['pay', 'Mi restituisce'], ['add', 'Presto altri soldi']];
+  return html`<${Sheet} title=${isMirror ? 'Segna sul mio conto' : isNew ? 'Movimento del prestito' : 'Modifica movimento'} onClose=${onClose}>
+    ${!loan && html`<p class="hint">Il prestito di questo movimento non esiste più: puoi solo modificarlo o spostarlo nel cestino.</p>`}
+    ${loan && html`<p class="hint">${loan.name}, con ${who}</p>`}
+    ${isMirror ? html`<p class="hint">${mirrorOf ? `${who} ha segnato ${loanMoveLabel(role === 'borrow' ? 'lend' : 'borrow', mirrorOf.kind).toLowerCase()} di ${eur(mirrorOf.amount)}. ` : ''}Qui registri solo il passaggio sul tuo conto: il debito non cambia, perché l’ha già contato ${who || 'l’altra persona'}.</p>`
+      : html`<div class="seg" style="margin-top:10px">${types.map(([k, l]) => html`<button type="button" class=${type === k ? 'on' : ''} onClick=${() => setType(k)}>${l}</button>`)}</div>`}
+    <${AmountField} big value=${amount} onInput=${setAmount} />
+    <div class="two"><label class="f"><span>Data</span><input class="i" type="date" value=${date} onInput=${e => setDate(e.target.value)} onChange=${e => setDate(e.target.value)} /></label>
+      <${LoanAccSelect} store=${store} value=${acc} onChange=${setAcc} label=${kind === 'income' ? 'Su quale conto arrivano' : 'Da quale conto escono'} /></div>
+    <label class="f"><span>Nota (facoltativa)</span><input class="i" value=${note} onInput=${e => setNote(e.target.value)} /></label>
+    ${err && html`<div class="err" role="alert">${err}</div>`}
+    <button class="btn" onClick=${save}>${isNew ? (isMirror ? 'Segna sul mio conto' : 'Aggiungi') : 'Salva modifiche'}</button>
+    ${!isNew && html`<button class="btn danger" onClick=${del}>Sposta nel cestino</button>`}
+  <//>`;
+}
+
+// ---------- prestiti: scheda ----------
+function Loans({ store, user, openSheet, openTx }) {
+  const uid = user.id, d = store.data;
+  const [sel, setSel] = useState(''), [other, setOther] = useState(null), [loading, setLoading] = useState(false), [err, setErr] = useState(''), [showClosed, setShowClosed] = useState(false);
+  const loans = allLoans(store);
+  const sharedIds = loans.filter(l => l.share_id).map(l => l.id).sort().join(',');
+  const load = async () => {
+    if (!sb || !sharedIds) { setOther([]); return; }
+    setLoading(true); setErr('');
+    try {
+      let out = [], from = 0;
+      for (;;) {
+        const { data: rows, error } = await sb.from('transactions').select('id,user_id,date,kind,amount,note,share_cat,loan_id,loan_amt,loan_ref,category_id,updated_at').in('loan_id', sharedIds.split(',')).neq('user_id', uid).eq('deleted', false).order('id').range(from, from + 999);
+        if (error) throw error;
+        out = out.concat(rows); if (rows.length < 1000) break; from += 1000;
+      }
+      setOther(out);
+    } catch (e) { setErr('Non riesco a scaricare i movimenti dei prestiti condivisi' + (navigator.onLine ? ': ' + (e.message || e) : ': sei offline.') + ' I residui possono non essere aggiornati.'); }
+    setLoading(false);
+  };
+  useEffect(() => { load(); }, [sharedIds]);
+  const refresh = async () => { await store.loadShares(); await store.loadOtherLoans(); load(); };
+
+  const movesOf = l => [...live(d.transactions).filter(t => t.loan_id === l.id).map(t => ({ ...t, mine: true })), ...(other || []).filter(t => t.loan_id === l.id).map(t => ({ ...t, mine: false }))];
+  const statOf = l => { const mv = movesOf(l); let debt = 0, lent = 0, back = 0; for (const t of mv) { const x = +t.loan_amt || 0; debt += x; if (x > 0) lent += x; else back -= x; } return { mv, debt: round2(debt), lent: round2(lent), back: round2(back) }; };
+  const sentence = (l, debt) => { const who = loanWho(l, store); if (debt <= 0.004) return 'Saldato'; return loanRole(l, uid) === 'borrow' ? 'Devi ancora a ' + who : who + ' ti deve ancora'; };
+  const cur = loans.find(l => l.id === sel);
+
+  if (!cur) {
+    const open = loans.filter(l => !l.closed), closed = loans.filter(l => l.closed);
+    const row = l => { const s = statOf(l); return html`<button key=${l.id} class="row loanrow" onClick=${() => { setSel(l.id); window.scrollTo(0, 0); }}><i class="dot" style=${'--c:' + (loanRole(l, uid) === 'borrow' ? 'var(--out)' : 'var(--in)')}></i>
+      <div class="mid"><div class="t">${l.name}${l.share_id ? html`<span class="tag">condiviso</span>` : null}</div><div class="s">${sentence(l, s.debt)}</div></div>
+      <div class="amt num">${eur(Math.max(0, s.debt))}</div></button>`; };
+    return html`<div>
+      ${!loans.length && html`<div class="empty">Qui tieni il conto dei prestiti: quelli che ricevi e quelli che fai. Li restituisci quando vuoi, con un bonifico o scalando una parte delle tue spese.</div>`}
+      ${open.length > 0 && html`<div class="list" style="margin-top:6px">${open.map(row)}</div>`}
+      ${err && html`<div class="err" role="alert">${err}</div>`}
+      <button class="btn" onClick=${() => openSheet({ k: 'loan', v: {} })}>+ Nuovo prestito</button>
+      ${closed.length > 0 && html`<button class="linkbtn" style="margin-top:14px" onClick=${() => setShowClosed(!showClosed)}>${showClosed ? 'Nascondi' : 'Mostra'} i prestiti chiusi (${closed.length})</button>
+        ${showClosed && html`<div class="list" style="margin-top:6px">${closed.map(row)}</div>`}`}
+      ${sharedIds && html`<button class="linkbtn" style="display:block;margin-top:10px" onClick=${refresh}>${loading ? 'Aggiornamento…' : 'Aggiorna'}</button>`}
+    </div>`;
+  }
+
+  const s = statOf(cur), role = loanRole(cur, uid), who = loanWho(cur, store), mine = cur.user_id === uid || !cur.user_id;
+  const share = cur.share_id ? store.shares.find(x => x.id === cur.share_id) : null, me = share ? myShareName(share, uid) : 'Io';
+  const mirrored = new Set(live(d.transactions).filter(t => t.loan_ref).map(t => t.loan_ref));
+  const pending = s.mv.filter(t => !t.mine && isLoanMove(t) && (+t.loan_amt || 0) !== 0 && !mirrored.has(t.id));
+  const list = s.mv.filter(t => (+t.loan_amt || 0) !== 0).sort((a, b) => b.date.localeCompare(a.date) || String(b.updated_at || '').localeCompare(String(a.updated_at || '')));
+  const days = []; for (const t of list) { const last = days[days.length - 1]; if (last && last.date === t.date) last.items.push(t); else days.push({ date: t.date, items: [t] }); }
+  const label = t => { const r = t.mine ? role : (role === 'borrow' ? 'lend' : 'borrow'); if (isLoanMove(t)) return loanMoveLabel(r, t.kind); return 'Spesa: ' + (t.mine ? (d.categories[t.category_id]?.name || 'senza voce') : (t.share_cat || 'spesa')) + ' di ' + eur(t.amount); };
+  return html`<div>
+    <button class="linkbtn" onClick=${() => setSel('')}>‹ Tutti i prestiti</button>
+    <div class="sec" style="margin-top:6px">${cur.name}${cur.closed ? html`<span class="tag">chiuso</span>` : null}</div>
+    <div class="card">
+      <div class="mut" style="font-size:.85rem">${sentence(cur, s.debt)}</div>
+      <div class="loanbig num">${eur(Math.max(0, s.debt))}</div>
+      <div class="calc num">${role === 'borrow' ? 'Ricevuti' : 'Prestati'} ${eur(s.lent)}, restituiti ${eur(s.back)}${s.debt < -0.004 ? ', restituiti ' + eur(-s.debt) + ' in più' : ''}</div>
+      ${err && html`<div class="err" role="alert">${err}</div>`}
+    </div>
+    ${!cur.closed && html`<button class="btn" onClick=${() => openSheet({ k: 'loanmove', v: { loan: cur, type: 'pay' } })}>${role === 'borrow' ? 'Registra una restituzione' : 'Registra un rimborso ricevuto'}</button>
+      <button class="btn sec2" style="margin-top:10px" onClick=${() => openSheet({ k: 'loanmove', v: { loan: cur, type: 'add' } })}>${role === 'borrow' ? 'Ho ricevuto altri soldi' : 'Ho prestato altri soldi'}</button>
+      ${role === 'borrow' && html`<p class="hint">Per scalare una spesa dal prestito, quando la aggiungi spunta “Usa per restituire un prestito” e scrivi quanto.</p>`}`}
+    ${pending.length > 0 && html`<div class="sec">Da segnare sui tuoi conti</div><div class="list">${pending.map(t => html`<div key=${'p' + t.id} class="row ro pend"><div class="mid"><div class="t">${loanMoveLabel(role === 'borrow' ? 'lend' : 'borrow', t.kind)} da ${who}</div><div class="s">${shortDate(t.date)}${t.note ? ', ' + t.note : ''}</div></div>
+      <div style="text-align:right"><div class="amt num">${eur(t.amount)}</div><button class="linkbtn" onClick=${() => openSheet({ k: 'loanmove', v: { loan: cur, mirrorOf: t } })}>Segna</button></div></div>`)}</div>
+      <p class="hint">${who} ha registrato questi movimenti. Segnali se vuoi che i soldi risultino anche sul tuo conto; il debito è già aggiornato.</p>`}
+    <div class="sec">Movimenti</div>
+    ${loading && other === null ? html`<div class="empty">Caricamento…</div>` : days.length === 0 ? html`<div class="empty">Nessun movimento.</div>`
+      : days.map(g => html`<div class="day">${dayLabel(g.date)}</div><div class="list">${g.items.map(t => {
+          const x = +t.loan_amt || 0;
+          const inner = html`<i class="dot" style=${'--c:' + (t.mine ? 'var(--in)' : 'var(--tax)')}></i>
+            <div class="mid"><div class="t">${label(t)}${share ? html`<span class="tag">${t.mine ? me : who}</span>` : null}${!t.mine && mirrored.has(t.id) ? html`<span class="tag">sul tuo conto</span>` : null}</div><div class="s">${(t.mine && isLoanMove(t) ? (d.accounts[t.account_id]?.name || 'nessun conto') + (t.note ? ', ' : '') : '') + (t.note || '') || ' '}</div></div>
+            <div class=${'amt num ' + (x < 0 ? 'in' : 'out')}>${x < 0 ? '−' : '+'}${eur(Math.abs(x))}</div>`;
+          return t.mine ? html`<button key=${t.id} class="row" onClick=${() => openTx(d.transactions[t.id])}>${inner}</button>` : html`<div key=${'o' + t.id} class="row ro">${inner}</div>`;
+        })}</div>`)}
+    <p class="hint">A destra c’è quanto cambia il debito: “−” lo riduce, “+” lo aumenta.${share ? ` Quelli di ${who} li vedi in sola lettura.` : ''}</p>
+    ${mine ? html`<button class="linkbtn" onClick=${() => openSheet({ k: 'loan', v: cur })}>Modifica, chiudi o elimina il prestito</button>` : html`<p class="hint">Il prestito l’ha creato ${who}: solo chi l’ha creato può rinominarlo o chiuderlo.</p>`}
+    ${sharedIds && html`<button class="linkbtn" style="display:block" onClick=${refresh}>${loading ? 'Aggiornamento…' : 'Aggiorna'}</button>`}
+  </div>`;
+}
+
 function Main({ user }) {
   const store = useMemo(() => createStore(user.id), [user.id]);
   const [, force] = useState(0);
@@ -1789,20 +2008,25 @@ function Main({ user }) {
   if (!hasAcc) return html`<${Welcome} store=${store} />`;
   const close = () => setSheet(null);
   if (d.settings.guide === 'show') return html`<${Guide} store=${store} onDone=${k => { store.setSettings({ guide: 'done' }); if (k === 'taxprofile') { setTab('tax'); setSheet({ k }); } window.scrollTo(0, 0); }} />`;
-  const TABS = [['mov', '☰', 'Movimenti'], ['charts', '▤', 'Grafici'], ['tax', '%', 'Tasse'], ['rec', '↻', 'Ricorrenti'], ['set', '⚙', 'Impostazioni']];
-  if (store.shares.length || tab === 'shared') TABS.splice(4, 0, ['shared', '⇄', 'Condivise']);
+  const TABS = [['mov', '☰', 'Movimenti', 'Movim.'], ['charts', '▤', 'Grafici', 'Grafici'], ['tax', '%', 'Tasse', 'Tasse'], ['rec', '↻', 'Ricorrenti', 'Ricorr.'], ['set', '⚙', 'Impostazioni', 'Impost.']];
+  if (store.shares.length || tab === 'shared') TABS.splice(4, 0, ['shared', '⇄', 'Condivise', 'Condiv.']);
+  if (allLoans(store).length || tab === 'loans') TABS.splice(TABS.length - 1, 0, ['loans', '⇆', 'Prestiti', 'Prestiti']);
+  const openTx = t => setSheet(t && isLoanMove(t) ? { k: 'loanmove', v: { loan: findLoan(store, t.loan_id), tx: t } } : { k: 'tx', v: t });
   return html`<div class="wrap">
     <div class="top"><h1>${TABS.find(t => t[0] === tab)[2]}</h1><${SyncPill} store=${store} /></div>
     <${IosInstallHint} />
-    ${tab === 'mov' && html`<${Movements} key=${movInit?.n || 0} init=${movInit} store=${store} openTx=${t => setSheet({ k: 'tx', v: t })} goTab=${setTab} />`}
+    ${tab === 'mov' && html`<${Movements} key=${movInit?.n || 0} init=${movInit} store=${store} openTx=${openTx} goTab=${setTab} />`}
     ${tab === 'charts' && html`<${Charts} store=${store} goMov=${goMov} />`}
     ${tab === 'rec' && html`<${Recurring} store=${store} openRec=${r => setSheet({ k: 'rec', v: r })} openPlan=${dl => setSheet({ k: 'plan', v: dl })} />`}
-    ${tab === 'tax' && html`<${TaxView} store=${store} openProfile=${() => setSheet({ k: 'taxprofile' })} openTx=${t => setSheet({ k: 'tx', v: t })} openOpening=${y => setSheet({ k: 'opening', v: y })} />`}
-    ${tab === 'shared' && html`<${Shared} store=${store} user=${user} openTx=${t => setSheet({ k: 'tx', v: t })} />`}
+    ${tab === 'tax' && html`<${TaxView} store=${store} openProfile=${() => setSheet({ k: 'taxprofile' })} openTx=${openTx} openOpening=${y => setSheet({ k: 'opening', v: y })} />`}
+    ${tab === 'shared' && html`<${Shared} store=${store} user=${user} openTx=${openTx} />`}
+    ${tab === 'loans' && html`<${Loans} store=${store} user=${user} openSheet=${setSheet} openTx=${openTx} />`}
     ${tab === 'set' && html`<${Settings} store=${store} user=${user} open=${k => setSheet({ k })} goTab=${k => { setTab(k); window.scrollTo(0, 0); }} />`}
     ${(tab === 'mov' || tab === 'charts' || tab === 'tax' || (tab === 'shared' && activeShares(store).length > 0)) && html`<button class="fab" onClick=${() => setSheet({ k: 'tx', v: {} })}>+ Movimento</button>`}
-    <nav class="tabs"><div class=${'in2' + (TABS.length > 5 ? ' six' : '')}>${TABS.map(([k, ic, l]) => html`<button class=${tab === k ? 'on' : ''} aria-current=${tab === k ? 'page' : null} onClick=${() => { if (k === 'mov') setMovInit(null); setTab(k); }}><span aria-hidden="true">${ic}</span>${l}</button>`)}</div></nav>
+    <nav class="tabs"><div class=${'in2' + (TABS.length > 6 ? ' seven' : TABS.length > 5 ? ' six' : '')}>${TABS.map(([k, ic, l, sh]) => html`<button class=${tab === k ? 'on' : ''} aria-current=${tab === k ? 'page' : null} aria-label=${l} onClick=${() => { if (k === 'mov') setMovInit(null); setTab(k); window.scrollTo(0, 0); }}><span aria-hidden="true">${ic}</span>${TABS.length > 6 ? sh : l}</button>`)}</div></nav>
     ${sheet?.k === 'tx' && html`<${TxForm} key=${sheet.v.id || 'new'} store=${store} tx=${sheet.v.id || tab !== 'shared' || activeShares(store).length !== 1 ? sheet.v : { kind: 'expense', share_id: activeShares(store)[0].id }} onClose=${close} />`}
+    ${sheet?.k === 'loan' && html`<${LoanForm} key=${sheet.v.id || 'new'} store=${store} loan=${sheet.v} onClose=${close} />`}
+    ${sheet?.k === 'loanmove' && html`<${LoanMoveForm} key=${sheet.v.tx?.id || 'new'} store=${store} v=${sheet.v} onClose=${close} />`}
     ${sheet?.k === 'rec' && html`<${RecForm} key=${sheet.v.id || 'new'} store=${store} rec=${sheet.v} onClose=${close} />`}
     ${sheet?.k === 'accounts' && html`<${AccountsEditor} store=${store} onClose=${close} />`}
     ${sheet?.k === 'categories' && html`<${CategoriesEditor} store=${store} onClose=${close} />`}
