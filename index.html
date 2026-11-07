@@ -254,10 +254,11 @@ function effects(t) {
   if (t.kind === 'transfer') return [[t.account_id, -a], [t.to_account_id, a]];
   return [];
 }
+// Saldi a oggi: i movimenti con data futura non contano finché non arriva il loro giorno (come in banca)
 function balances(d) {
-  const b = {};
+  const b = {}, today = todayIso();
   for (const a of live(d.accounts)) b[a.id] = Number(a.initial_balance) || 0;
-  for (const t of live(d.transactions)) for (const [acc, v] of effects(t)) if (acc in b) b[acc] = round2(b[acc] + v);
+  for (const t of live(d.transactions)) { if (t.date > today) continue; for (const [acc, v] of effects(t)) if (acc in b) b[acc] = round2(b[acc] + v); }
   return b;
 }
 
@@ -269,13 +270,19 @@ function balanceAt(d, accId, until) {
   for (const t of live(d.transactions)) { if (t.date > until) continue; for (const [acc, v] of effects(t)) if (acc === accId) b += v; }
   return round2(b);
 }
-// Ciclo della carta con addebito nel mese ym: chiusura nel mese precedente (giorno scelto o fine mese)
+// Ciclo della carta con addebito nel mese ym: la chiusura è nello stesso mese se il giorno di chiusura
+// viene prima di quello di addebito (es. chiusura 5, addebito 20), altrimenti nel mese precedente (es. fine mese, addebito 15)
 function cardCycle(card, ym) {
-  const [y, m] = ym.split('-').map(Number), pym = addMonths(ym, -1), [py, pm] = pym.split('-').map(Number);
-  const charge = `${ym}-${pad(Math.min(Number(card.charge_day) || 15, daysIn(y, m)))}`;
-  const close = `${pym}-${pad(Math.min(Number(card.close_day) || 31, daysIn(py, pm)))}`;
+  const chargeDay = Number(card.charge_day) || 15, closeDay = Number(card.close_day) || 31;
+  const cym = closeDay < chargeDay ? ym : addMonths(ym, -1);
+  const [y, m] = ym.split('-').map(Number), [cy, cm] = cym.split('-').map(Number);
+  const charge = `${ym}-${pad(Math.min(chargeDay, daysIn(y, m)))}`;
+  const close = `${cym}-${pad(Math.min(closeDay, daysIn(cy, cm)))}`;
   return { ym, charge, close, id: `cc:${card.id}:${ym}` };
 }
+// Addebiti automatici della carta registrati dopo la chiusura e prima del prossimo addebito: hanno già pagato
+// spese fino a quella chiusura, quindi vanno tolti anche se la loro data viene dopo la chiusura
+const chargesBetween = (d, card, from, to) => live(d.transactions).filter(t => String(t.id).startsWith(`cc:${card.id}:`) && t.date > from && t.date < to).reduce((x, t) => x + (Number(t.amount) || 0), 0);
 // Addebiti dovuti (data di addebito già arrivata) e non ancora registrati
 function dueCardCharges(d) {
   const today = todayIso(), rows = [];
@@ -286,7 +293,7 @@ function dueCardCharges(d) {
       const c = cardCycle(card, ym);
       if (c.charge < since || c.charge > today || d.transactions[c.id]) continue;
       // conta anche gli addebiti appena calcolati in questo giro (se l'app non si apriva da mesi)
-      const amt = round2(-balanceAt(d, card.id, c.close) - added.filter(r => r.date <= c.close).reduce((x, r) => x + r.amount, 0));
+      const amt = round2(-balanceAt(d, card.id, c.close) - chargesBetween(d, card, c.close, c.charge) - added.reduce((x, r) => x + r.amount, 0));
       if (amt > 0.004) added.push({ date: c.charge, amount: amt }), rows.push({ id: c.id, date: c.charge, kind: 'transfer', amount: amt, account_id: card.charge_account_id, to_account_id: card.id, category_id: null, note: `Addebito carta ${card.name}, spese fino al ${shortDate(c.close)}`, deleted: false });
     }
   }
@@ -296,7 +303,7 @@ function dueCardCharges(d) {
 function cardStatus(d, card) {
   const today = todayIso(), bal = balances(d)[card.id] ?? 0, debt = round2(Math.max(0, -bal));
   let c = cardCycle(card, ymOf(today)); if (c.charge <= today) c = cardCycle(card, addMonths(ymOf(today), 1));
-  const nextAmt = round2(Math.min(debt, Math.max(0, -balanceAt(d, card.id, c.close))));
+  const nextAmt = round2(Math.min(debt, Math.max(0, -balanceAt(d, card.id, c.close) - chargesBetween(d, card, c.close, c.charge))));
   const after = cardCycle(card, addMonths(c.ym, 1));
   const limit = Number(card.card_limit) || 0;
   return { debt, next: c, nextAmt, after, afterAmt: round2(debt - nextAmt), avail: limit ? round2(limit - debt) : null, limit };
@@ -685,7 +692,7 @@ function KindSeg({ kind, setKind }) {
 
 // ---------- modulo movimento ----------
 function TxForm({ store, tx, onClose }) {
-  const d = store.data, s = d.settings, isNew = !tx.id;
+  const d = store.data, s = d.settings, isNew = !tx.id || !d.transactions[tx.id];
   const firstAcc = live(d.accounts).filter(a => !a.archived).sort(bySort)[0]?.id || '';
   const [kind, setKind] = useState(tx.kind || 'expense');
   const [amount, setAmount] = useState(fmtIn(tx.amount));
@@ -701,7 +708,7 @@ function TxForm({ store, tx, onClose }) {
   const [err, setErr] = useState('');
   const [taxPart, setTaxPart] = useState(tx.tax_part || 'acconto');
   const [taxYear, setTaxYear] = useState(tx.tax_year ? String(tx.tax_year) : '');
-  const [fund, setFund] = useState(tx.id ? (tx.fund_account_id || '') : null);
+  const [fund, setFund] = useState(!isNew ? (tx.fund_account_id || '') : null);
   const [shareId, setShareId] = useState(tx.share_id || '');
   const borrowLoans = allLoans(store).filter(l => loanRole(l, store.uid) === 'borrow' && (!l.closed || l.id === tx.loan_id));
   const [useLoan, setUseLoan] = useState(!!tx.loan_id && !!tx.category_id);
@@ -762,7 +769,7 @@ function TxForm({ store, tx, onClose }) {
     ${kind === 'income' && html`<label class="check"><input type="checkbox" checked=${invoiced} onChange=${e => setInvoiced(e.target.checked)} />Con fattura</label>`}
     ${isTaxCat && html`<label class="f"><span>Questo versamento è</span><div class="seg">${[['acconto', 'Acconto'], ['saldo', 'Saldo'], ['altro', 'Altro']].map(([k, l]) => html`<button type="button" class=${taxPart === k ? 'on' : ''} onClick=${() => setTaxPart(k)}>${l}</button>`)}</div></label>
       <label class="f"><span>Anno dei redditi a cui si riferisce</span><input class="i num" inputmode="numeric" value=${taxYear || defYear(taxPart)} onInput=${e => setTaxYear(e.target.value)} /></label>
-      <p class="hint">Esempio: a giugno 2026 il saldo è per i redditi 2025, gli acconti per i redditi 2026.</p>`}
+      <p class="hint">Esempio: a giugno 2026 il saldo è per i redditi 2025, gli acconti per i redditi 2026. Se una parte è stata compensata con crediti, scrivi solo quanto è uscito dal conto e aggiungi il resto in Tasse → totali.</p>`}
     ${kind === 'expense' && html`<${SharePick} store=${store} value=${shareId} onChange=${setShareId} />`}
     ${kind === 'expense' && borrowLoans.length > 0 && html`<label class="check"><input type="checkbox" checked=${useLoan} onChange=${e => { setUseLoan(e.target.checked); if (!loanId) setLoanId(borrowLoans[0].id); }} />Usa per restituire un prestito</label>
       ${useLoan && html`${borrowLoans.length > 1 ? html`<label class="f"><span>Prestito</span><select class="i" value=${loanId} onChange=${e => setLoanId(e.target.value)}>${borrowLoans.map(l => html`<option value=${l.id}>${l.name}, con ${loanWho(l, store)}</option>`)}</select></label>`
@@ -967,7 +974,7 @@ function RecForm({ store, rec, onClose }) {
     ${!isNew && html`<button class="btn danger" onClick=${del}>Elimina ricorrenza</button>`}
   <//>`;
 }
-function Recurring({ store, openRec, openPlan }) {
+function Recurring({ store, openRec, openPlan, openTx }) {
   const d = store.data, today = todayIso();
   const reminders = useMemo(() => pendingReminders(d), [store.st.version]);
   const tw = useMemo(() => taxWindows(d), [store.st.version]);
@@ -976,13 +983,13 @@ function Recurring({ store, openRec, openPlan }) {
   const skip = p => { if (confirm('Segnare come da non registrare? Non verrà più proposto.')) store.upsert('transactions', { ...txFromRec(p.r, p.date, p.id), deleted: true }); };
   return html`<div>
     ${(reminders.length > 0 || tw.due.length > 0) && html`<div class="sec">Da registrare</div>`}
-    ${tw.due.length > 0 && html`<div class="list" style="margin-bottom:8px">${tw.due.map(dl => html`<${DeadlineRow} key=${dl.id} store=${store} dl=${dl} past=${dl.date <= today} openPlan=${openPlan} />`)}</div>`}
+    ${tw.due.length > 0 && html`<div class="list" style="margin-bottom:8px">${tw.due.map(dl => html`<${DeadlineRow} key=${dl.id} store=${store} dl=${dl} past=${dl.date <= today} openPlan=${openPlan} openTx=${openTx} />`)}</div>`}
     ${reminders.length > 0 && html`<div class="list">${reminders.map(p => html`<div class="row" style="cursor:default">
       <i class="dot" style=${'--c:' + (d.categories[p.r.category_id]?.color || '#999')}></i>
       <div class="mid"><div class="t">${p.r.note || d.categories[p.r.category_id]?.name || 'Ricorrenza'}</div><div class="s">scadenza ${shortDate(p.date)}, ${eur(p.r.amount)}</div></div>
       <button class="chip" onClick=${() => register(p)}>Registra</button><button class="linkbtn" onClick=${() => skip(p)} aria-label="Ignora">Ignora</button></div>`)}</div>`}
-    ${tw.upcoming.length > 0 && html`<div class="sec">Prossime scadenze fiscali</div><div class="list">${tw.upcoming.map(dl => html`<${DeadlineRow} key=${dl.id} store=${store} dl=${dl} openPlan=${openPlan} />`)}</div>
-      <p class="hint">Calcolate dal profilo fiscale e dalla stima della scheda Tasse. Quando paghi, premi Registra e correggi l’importo con quello dell’F24 o dell’avviso: acconto, saldo e anno si impostano da soli.</p>`}
+    ${tw.upcoming.length > 0 && html`<div class="sec">Prossime scadenze fiscali</div><div class="list">${tw.upcoming.map(dl => html`<${DeadlineRow} key=${dl.id} store=${store} dl=${dl} openPlan=${openPlan} openTx=${openTx} />`)}</div>
+      <p class="hint">Calcolate dal profilo fiscale e dalla stima della scheda Tasse. Quando paghi, premi Registra, controlla il conto e correggi l’importo con quello dell’F24 o dell’avviso: acconto, saldo e anno si impostano da soli.</p>`}
     <div class="sec">Ricorrenze</div>
     ${recs.length === 0 ? html`<div class="empty">Aggiungi qui affitto, abbonamenti, stipendio o scadenze annuali come l’assicurazione.</div>`
       : html`<div class="list">${recs.map(r => { const c = d.categories[r.category_id], nx = r.active ? nextOccurrence(r, today) : null; return html`<button class="row" onClick=${() => openRec(r)}>
@@ -1046,13 +1053,13 @@ function AccountForm({ store, acc, onDone, onClose }) {
       <label class="f"><span>Nome</span><input class="i" value=${name} onInput=${e => setName(e.target.value)} placeholder="Es. Banca, Carta prepagata" /></label></div>
     ${card && html`<div class="two"><label class="f"><span>Giorno di addebito</span><input class="i num" inputmode="numeric" value=${chargeDay} onInput=${e => setChargeDay(e.target.value)} /></label>
       <label class="f"><span>Chiusura estratto conto</span><input class="i num" inputmode="numeric" placeholder="fine mese" value=${closeDay} onInput=${e => setCloseDay(e.target.value)} /></label></div>
-      <p class="hint">Ogni mese, nel giorno di addebito, l’app registra da sola un giroconto dal conto scelto qui sotto alla carta, per il totale delle spese fatte fino alla chiusura del mese precedente. Le spese restano nei grafici con la loro data e la loro voce; l’addebito non conta come uscita, così non si contano due volte.</p>
+      <p class="hint">Ogni mese, nel giorno di addebito, l’app registra da sola un giroconto dal conto scelto qui sotto alla carta, per il totale delle spese fatte fino alla chiusura dell’estratto conto (se la chiusura viene prima del giorno di addebito, è nello stesso mese; altrimenti nel mese precedente). Le spese restano nei grafici con la loro data e la loro voce; l’addebito non conta come uscita, così non si contano due volte.</p>
       <${AccountSelect} store=${store} value=${chargeAcc} onChange=${setChargeAcc} exclude=${acc.id} label="Addebitata sul conto" noCards />
       <${AmountField} label="Plafond (facoltativo)" value=${limit} onInput=${setLimit} />`}
     ${pp && html`<label class="f"><span>Metodo di pagamento abituale</span><select class="i" value=${chargeAcc} onChange=${e => setChargeAcc(e.target.value)}><option value="">Saldo PayPal</option>
         ${live(store.data.accounts).filter(x => !x.archived && !isPaypal(x) && x.id !== acc.id).sort(bySort).map(x => html`<option value=${x.id}>${(x.icon ? x.icon + ' ' : '') + x.name}</option>`)}</select></label>
       <p class="hint">Viene proposto quando registri un pagamento con PayPal, e puoi cambiarlo ogni volta. L’app preleva l’importo da lì (anche a rate), così la spesa conta una volta sola e il conto o la carta scendono quando vengono davvero addebitati.</p>`}
-    ${!isNew && !card && html`<div class="card" style="margin-top:14px"><div class="mut" style="font-size:.85rem">Saldo attuale in app</div><div class="num" style="font-size:1.5rem;font-weight:800">${eur(curBal)}</div>
+    ${!isNew && !card && html`<div class="card" style="margin-top:14px"><div class="mut" style="font-size:.85rem">Saldo in app a oggi (senza movimenti con data futura)</div><div class="num" style="font-size:1.5rem;font-weight:800">${eur(curBal)}</div>
       <${AmountField} label="Saldo reale (quello che vedi in banca)" value=${real} onInput=${setReal} />
       <button class="btn sec2" onClick=${adjust}>Correggi saldo</button>
       <p class="hint">Aggiunge un movimento “Rettifica saldo” con la differenza. Non conta nelle entrate, nelle uscite e nei grafici, e se serve puoi eliminarlo dai movimenti.</p>
@@ -1327,13 +1334,14 @@ function taxCatFor(store, role) {
   store.upsert('categories', { id, name: role === 'imposta' ? (P.regime === 'ordinario' ? 'IRPEF' : 'Imposta sostitutiva') : 'Contributi ENPAB', kind: 'expense', scope: 'tax', color: COLORS[role === 'imposta' ? 5 : 8], sort: 900 });
   return id;
 }
-function registerDeadline(store, dl) {
-  const amt = prompt(`${dl.label}: importo pagato\n(se una parte è stata compensata con crediti, scrivi solo quanto è uscito dal conto e aggiungi il resto in Tasse → totali)`, dl.amount != null ? fmtIn(dl.amount) : '');
-  if (amt === null) return;
-  const a = parseAmt(amt); if (!(a > 0)) return alert('Importo non valido.');
+// Movimento proposto per una scadenza fiscale: si apre nel modulo normale, così il conto si vede e si sceglie.
+// Conto proposto: quello dell'ultimo versamento di tasse/contributi (non l'ultimo conto usato, che può essere i contanti)
+function deadlineTx(store, dl) {
   const d = store.data, s = d.settings, today = todayIso();
-  const acc = (d.accounts[s.last_account] && !d.accounts[s.last_account].deleted && !isCard(d.accounts[s.last_account]) && !isPaypal(d.accounts[s.last_account]) && s.last_account) || live(d.accounts).filter(x => !x.archived && !isCard(x) && !isPaypal(x)).sort(bySort)[0]?.id;
-  store.upsert('transactions', { id: dl.id, date: today < dl.date ? today : dl.date, kind: 'expense', amount: round2(a), account_id: acc, category_id: taxCatFor(store, dl.role), note: dl.label, tax_part: dl.part, tax_year: dl.year, deleted: false });
+  const ok = a => !!a && !a.deleted && !a.archived && !isCard(a) && !isPaypal(a);
+  const lastTax = live(d.transactions).filter(t => t.kind === 'expense' && !isOff(t) && d.categories[t.category_id]?.scope === 'tax' && ok(d.accounts[t.account_id])).sort((a, b) => b.date.localeCompare(a.date))[0];
+  const acc = lastTax?.account_id || (ok(d.accounts[s.last_account]) && s.last_account) || live(d.accounts).filter(ok).sort(bySort)[0]?.id || '';
+  return { id: dl.id, date: today < dl.date ? today : dl.date, kind: 'expense', amount: dl.amount != null ? round2(dl.amount) : '', account_id: acc, category_id: taxCatFor(store, dl.role), note: dl.label, tax_part: dl.part, tax_year: dl.year };
 }
 function skipDeadline(store, dl) {
   if (!confirm(`Non registrare "${dl.label}"? Non verrà più proposto (per esempio se l’hai già registrato in altro modo o non era dovuto).`)) return;
@@ -1345,11 +1353,11 @@ function removePlan(store, dl) {
   if (!confirm('Annullare la rateizzazione e tornare al pagamento in un’unica soluzione?')) return;
   const plans = { ...(P.plans || {}) }; delete plans[dl.parent]; store.setSettings({ tax: { ...P, plans } });
 }
-function DeadlineRow({ store, dl, past, openPlan }) {
+function DeadlineRow({ store, dl, past, openPlan, openTx }) {
   return html`<div class="row" style="cursor:default;flex-wrap:wrap">
     <i class="dot" style="--c:var(--tax)"></i>
     <div class="mid"><div class="t">${dl.label}</div><div class="s">${past ? 'scadenza' : 'entro il'} ${shortDate(dl.date)}, ${dl.amount != null ? 'stima ' + eur(dl.amount) : 'importo dall’avviso'}${dl.hint ? ', ' + dl.hint : ''}</div></div>
-    <button class="chip" onClick=${() => registerDeadline(store, dl)}>Registra</button>
+    <button class="chip" onClick=${() => openTx(deadlineTx(store, dl))}>Registra</button>
     ${dl.rate && openPlan ? html`<button class="linkbtn" onClick=${() => openPlan(dl)}>Rate</button>` : null}
     ${dl.parent && dl.id.endsWith(':r1') ? html`<button class="linkbtn" onClick=${() => removePlan(store, dl)}>Annulla rate</button>` : null}
     ${!dl.parent ? html`<button class="linkbtn" onClick=${() => skipDeadline(store, dl)}>Ignora</button>` : null}</div>`;
@@ -2025,7 +2033,7 @@ function Main({ user }) {
     <${IosInstallHint} />
     ${tab === 'mov' && html`<${Movements} key=${movInit?.n || 0} init=${movInit} store=${store} openTx=${openTx} goTab=${setTab} />`}
     ${tab === 'charts' && html`<${Charts} store=${store} goMov=${goMov} />`}
-    ${tab === 'rec' && html`<${Recurring} store=${store} openRec=${r => setSheet({ k: 'rec', v: r })} openPlan=${dl => setSheet({ k: 'plan', v: dl })} />`}
+    ${tab === 'rec' && html`<${Recurring} store=${store} openRec=${r => setSheet({ k: 'rec', v: r })} openPlan=${dl => setSheet({ k: 'plan', v: dl })} openTx=${openTx} />`}
     ${tab === 'tax' && html`<${TaxView} store=${store} openProfile=${() => setSheet({ k: 'taxprofile' })} openTx=${openTx} openOpening=${y => setSheet({ k: 'opening', v: y })} />`}
     ${tab === 'shared' && html`<${Shared} store=${store} user=${user} openTx=${openTx} />`}
     ${tab === 'loans' && html`<${Loans} store=${store} user=${user} openSheet=${setSheet} openTx=${openTx} />`}
